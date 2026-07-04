@@ -1,0 +1,24 @@
+# Gold Bot v2 – Python Dependencies
+# Install: pip install -r requirements.txt
+
+# Telegram Bot framework (async, v21+)
+python-telegram-bot>=21.0
+
+# Google Sheets client
+gspread>=6.0.0
+
+# Google authentication
+google-auth>=2.20.0
+
+# HTTP client (image download fallback, gold price scraper)
+requests>=2.31.0
+
+# HTML parser for tgju.org scraping
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# Environment variable loader
+python-dotenv>=1.0.0
+
+# Groq AI (fast inference, OpenAI-compatible Chat Completions API)
+groq>=0.9.0
