@@ -15,6 +15,25 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 
+def _md_escape(value) -> str:
+    """
+    Escape Telegram legacy-Markdown special characters in free-text values.
+
+    Product fields (name, description, tags, category, ...) are typed
+    directly by the admin and can contain characters like *, _, ` or [
+    that Telegram's Markdown parser interprets as formatting. An unmatched
+    one of these crashes send_message/send_photo with:
+        "Can't parse entities: can't find end of the entity"
+
+    Escaping with a backslash makes the character literal, regardless of
+    what the admin typed, so product data can never break message parsing.
+    """
+    text = str(value)
+    for ch in ("\\", "`", "*", "_", "["):
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
 @dataclass
 class Product:
     # ── Identity ───────────────────────────────────────────────────────────────
@@ -155,21 +174,22 @@ class Product:
         )
 
     def admin_detail(self) -> str:
+        e = _md_escape
         po = f"\n💵 قیمت ثابت: `{self.price_override:,.0f} تومان`" if self.price_override else ""
         photo_line = "✅ دارد" if self.has_photo else "❌ ندارد (عکس ارسال نشده)"
         return (
-            f"*💍 {self.name}*\n\n"
+            f"*💍 {e(self.name)}*\n\n"
             f"🆔 شناسه: `{self.id}`\n"
-            f"📂 دسته: `{self.category}` / `{self.subcategory or '—'}`\n"
-            f"👤 جنسیت: `{self.gender or 'نامشخص'}`\n"
-            f"🎨 رنگ طلا: `{self.gold_color or '—'}` | عیار: `{self.purity}`\n"
-            f"💎 سنگ: `{self.stone or 'بدون سنگ'}` ({self.stone_color or '—'})\n"
+            f"📂 دسته: `{e(self.category)}` / `{e(self.subcategory) or '—'}`\n"
+            f"👤 جنسیت: `{e(self.gender) or 'نامشخص'}`\n"
+            f"🎨 رنگ طلا: `{e(self.gold_color) or '—'}` | عیار: `{e(self.purity)}`\n"
+            f"💎 سنگ: `{e(self.stone) or 'بدون سنگ'}` ({e(self.stone_color) or '—'})\n"
             f"⚖️ وزن: `{self.weight} گرم`\n"
             f"🛠 اجرت: `{self.wage_percent}٪` | سود: `{self.profit_percent}٪`\n"
             f"📦 موجودی: `{self.stock}`\n"
-            f"📌 کالکشن: `{self.collection or '—'}`\n"
-            f"🏷 برچسب‌ها: `{self.tags or '—'}`\n"
-            f"📝 توضیحات: {self.description or '—'}\n"
+            f"📌 کالکشن: `{e(self.collection) or '—'}`\n"
+            f"🏷 برچسب‌ها: `{e(self.tags) or '—'}`\n"
+            f"📝 توضیحات: {e(self.description) or '—'}\n"
             f"🖼 تصویر: {photo_line}\n"
             f"🌐 وضعیت: `{self.status_emoji} {self.status}`\n"
             f"📢 منتشر شده: `{'بله – ' + self.published_message_id if self.is_published else 'خیر'}`"
@@ -178,10 +198,11 @@ class Product:
 
     def channel_caption(self) -> str:
         """Caption for the Telegram channel post."""
+        e = _md_escape
         return (
-            f"💍 *{self.name}*\n\n"
-            f"🎨 رنگ طلا: `{self.gold_color or '—'}` | عیار: `{self.purity}`\n"
-            f"💎 سنگ: `{self.stone or 'بدون سنگ'}`\n"
+            f"💍 *{e(self.name)}*\n\n"
+            f"🎨 رنگ طلا: `{e(self.gold_color) or '—'}` | عیار: `{e(self.purity)}`\n"
+            f"💎 سنگ: `{e(self.stone) or 'بدون سنگ'}`\n"
             f"⚖️ وزن: `{self.weight} گرم`\n"
             f"🛠 اجرت: `{self.wage_percent}٪` | سود: `{self.profit_percent}٪`\n"
             f"📦 موجودی: `{self.stock} عدد`"
