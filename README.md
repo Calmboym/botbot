@@ -211,12 +211,17 @@ Tab name: **`faq`**
 
 ### Sheet 4 — `customers`
 
-Created automatically on first customer message. Headers:
+Created automatically on first customer message. Headers (auto-created):
 
 ```
-user_id | name | category | gold_color | stone | max_weight |
-max_budget | gender | style | notes | notify | last_seen | updated_at
+user_id | name | category | gender | gold_color | stone |
+max_budget | min_budget | max_weight | min_weight | style_keywords |
+occasion | shopping_stage | interest_level | notify | last_seen | updated_at
 ```
+
+> ⚠️ **If upgrading from an older version:** this schema replaced an
+> earlier, simpler `customers` sheet. Delete (or rename) any existing
+> `customers` tab so the bot recreates it with the new columns on first use.
 
 ### Share with Service Account
 
@@ -224,15 +229,90 @@ max_budget | gender | style | notes | notify | last_seen | updated_at
 
 ---
 
-## 🤖 Groq Setup
+## 🤖 AI Provider Setup
+
+The AI layer is **provider-independent** — business logic never talks to
+Groq (or any vendor) directly, only to a `BaseAIProvider` interface (see
+`providers/`). Switching providers is a single `.env` change:
+
+```env
+AI_PROVIDER=groq     # or: gemini | openai
+```
+
+### Groq (default — fully implemented)
 
 1. Go to [console.groq.com](https://console.groq.com)
 2. Sign up (free)
 3. **API Keys → Create API Key**
-4. Copy the key (starts with `gsk_`)
+4. Copy the key (starts with `gsk_`) into `.env` as `GROQ_API_KEY`
 
-Default model: `llama-3.3-70b-versatile`
-Vision model: `meta-llama/llama-4-scout-17b-16e-instruct`
+Default text model: `llama-3.3-70b-versatile`
+Default vision model: `meta-llama/llama-4-scout-17b-16e-instruct`
+
+### Gemini / OpenAI (skeletons — not yet implemented)
+
+`providers/gemini_provider.py` and `providers/openai_provider.py` exist as
+empty skeletons with clear TODOs. Implementing either one and setting
+`AI_PROVIDER=gemini` (or `openai`) in `.env` is enough to switch — **no
+other file in the project needs to change.**
+
+---
+
+## 🧠 AI Architecture (how the assistant actually works)
+
+```
+Customer message
+      │
+      ▼
+1. Cheap local checks (no AI call)
+   - explicit photo keyword + focused product → send photo, done
+   - local_extract(): regex-based Persian parsing seeds a SearchQuery
+     for THIS message (so even the very first message gets matched
+     against real products before any AI call)
+      │
+      ▼
+2. search_service.search()
+   - merges the local query with the customer's cumulative profile
+   - scores every available product (category, budget, color, stone,
+     style, weight, occasion, + long-term profile bonus)
+   - returns only the top-N ranked products as the AI's candidate list
+      │
+      ▼
+3. ONE AI call → AIService.handle_message()
+   - provider-independent (BaseAIProvider.generate(..., json_mode=True))
+   - returns a single validated JSON object (models.ai_models.AIResponse):
+       reply, needs_support, image_product_ids, intent
+   - "intent" is a full IntentExtraction: category/budget/color/stone/
+     style/occasion PLUS shopping_stage, urgency, emotion, purchase
+     readiness, interest level, wants_notification — extracted in the
+     SAME call as the reply, so no second AI call is needed per message
+      │
+      ▼
+4. CustomerProfile.merge_intent(intent)
+   - cumulative, non-destructive merge — a new field REPLACES only
+     itself; everything else (and interest_level, which only ever
+     increases) is preserved
+   - persisted to the `customers` sheet in the background
+      │
+      ▼
+5. SummaryService (every SUMMARY_TRIGGER_MESSAGES turns)
+   - regenerates a short rolling ConversationSummary via a small AI call
+   - the AI NEVER receives full chat history — only:
+     recent messages (capped) + this summary + the cumulative profile
+      │
+      ▼
+6. Follow-up system
+   - if intent.wants_notification, or purchase_readiness ≥ 70, or the
+     customer has any concrete preference (offered periodically), the
+     bot offers to notify them on restock
+   - restock notifications use search_service.notification_similarity()
+     — a normalized 0..1 score against NOTIFICATION_SIMILARITY_THRESHOLD
+```
+
+**JSON safety:** every AI response is validated with Pydantic
+(`AIResponse.model_validate`). An invalid response is retried once
+(`AI_RETRY_COUNT`) with a stricter reminder; if that also fails, a safe
+fallback message is returned — the bot never crashes on a bad model output.
 
 ---
 
@@ -273,7 +353,9 @@ SPREADSHEET_NAME=Gold Products
 LOG_LEVEL=INFO
 CACHE_TIME=300
 PRICE_UPDATE_INTERVAL=3600   # 0 = disable auto update
-CONV_HISTORY_PAIRS=10        # AI memory depth (pairs of messages)
+AI_PROVIDER=groq
+RECENT_MESSAGES_COUNT=6      # rolling window sent to the AI
+SUMMARY_TRIGGER_MESSAGES=6   # regenerate summary every N messages
 ```
 
 | Variable | Required | Default | Description |
@@ -281,14 +363,22 @@ CONV_HISTORY_PAIRS=10        # AI memory depth (pairs of messages)
 | `TOKEN` | ✅ | — | Telegram bot token |
 | `ADMIN_ID` | ✅ | — | Your numeric Telegram ID |
 | `CHANNEL_USERNAME` | ✅ | — | Channel with `@` |
-| `GROQ_API_KEY` | ✅ | — | Groq API key |
+| `AI_PROVIDER` | ❌ | groq | `groq` \| `gemini` \| `openai` (see providers/) |
+| `GROQ_API_KEY` | ✅ (if AI_PROVIDER=groq) | — | Groq API key |
 | `SPREADSHEET_NAME` | ✅ | — | Exact spreadsheet name |
 | `GROQ_MODEL` | ❌ | llama-3.3-70b-versatile | Text model |
 | `GROQ_VISION_MODEL` | ❌ | llama-4-scout-17b-… | Vision model |
+| `AI_TEMPERATURE` | ❌ | 0.7 | Sampling temperature |
+| `AI_MAX_TOKENS` | ❌ | 1500 | Max tokens per AI response |
+| `AI_RETRY_COUNT` | ❌ | 1 | Extra attempts on invalid JSON |
+| `AI_TIMEOUT` | ❌ | 30 | Provider request timeout (seconds) |
+| `RECENT_MESSAGES_COUNT` | ❌ | 6 | Messages kept in the rolling window |
+| `SUMMARY_TRIGGER_MESSAGES` | ❌ | 6 | Regenerate summary every N messages |
+| `SUMMARY_MAX_CHARS` | ❌ | 500 | Max length of the rolling summary |
+| `NOTIFICATION_SIMILARITY_THRESHOLD` | ❌ | 0.55 | Min score (0..1) to trigger a restock notification |
 | `LOG_LEVEL` | ❌ | INFO | DEBUG/INFO/WARNING/ERROR |
 | `CACHE_TIME` | ❌ | 300 | Sheet cache TTL (seconds) |
 | `PRICE_UPDATE_INTERVAL` | ❌ | 3600 | Auto gold price update interval (seconds, 0=off) |
-| `CONV_HISTORY_PAIRS` | ❌ | 10 | Messages kept in AI memory per user |
 
 ---
 
@@ -408,6 +498,9 @@ If `price_override` is set, it replaces the formula entirely.
 | Sheet changes not visible | Use `/admin` → 🔄 همگام‌سازی شیت |
 | `Forbidden` sending to customer | User must send `/start` to the bot first |
 | Groq `AuthenticationError` | Check `GROQ_API_KEY` in `.env` |
+| `ProviderError: Unknown AI_PROVIDER` | `AI_PROVIDER` must be `groq`, `gemini`, or `openai` (Gemini/OpenAI need their skeleton implemented first) |
+| AI reply looks generic / ignores request | Check logs for "AI JSON parse/validation failed" — the model may need a stronger reminder; increase `AI_RETRY_COUNT` |
+| Customer preferences "forgotten" after restart | Confirm `customers` sheet exists and the service account has Editor access — profile reloads from there on a fresh session |
 | Auto price update not running | Check `PRICE_UPDATE_INTERVAL` > 0 in `.env` |
 | `customers` sheet not created | Send at least one message as a customer to trigger auto-creation |
 
