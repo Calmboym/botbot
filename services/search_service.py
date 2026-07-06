@@ -1,59 +1,45 @@
 """
 Gold Bot v2 – Search Service
 ==============================
-Python-side product filtering that runs BEFORE any AI call.
-GPT never receives the full product list – only the filtered subset.
+Two layers of intelligence, both LOCAL (no AI call) for speed and cost:
 
-Flow:
-    1. extract_filters(user_text)  →  SearchFilters
-    2. filter_products(products, filters, gold_price)  →  list[Product]
-    3. Filtered list is passed to AIService
+1. local_extract(text)   – cheap regex-based Persian keyword extraction,
+                            used to seed a search query for the CURRENT
+                            message before any AI call is made. This solves
+                            the "first message" problem: even the very
+                            first thing a customer says gets matched against
+                            real products before the AI ever runs.
+
+2. score_product(...)    – weighted relevance scoring (category, budget,
+                            color, stone, style, weight, occasion, and the
+                            customer's longer-term profile) used to RANK
+                            products, not just filter them in/out.
+
+The richer, LLM-based IntentExtraction (shopping stage, emotion, urgency,
+purchase readiness, etc.) happens inside the AI's own structured response
+(see services/ai_service.py) and is merged into the CustomerProfile for
+FUTURE turns — it does not need to run again here.
+
+A separate, stricter function — notification_similarity() — powers the
+restock-notification follow-up system with a normalized 0..1 score.
 """
 
 from __future__ import annotations
 
 import re
 import logging
-from dataclasses import dataclass, field
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
+
+from config.config import MAX_SEARCH_RESULTS
+from models.ai_models import CustomerProfile, ProductContext, SearchQuery, SearchResult
 
 if TYPE_CHECKING:
     from models.product import Product
 
-from services.price_service import calculate_price
-from config.config import MAX_SEARCH_RESULTS
-
 logger = logging.getLogger(__name__)
 
 
-# ── Filter Dataclass ──────────────────────────────────────────────────────────
-
-@dataclass
-class SearchFilters:
-    max_budget:     Optional[float]  = None
-    min_budget:     Optional[float]  = None
-    gender:         Optional[str]    = None
-    category:       Optional[str]    = None
-    gold_color:     Optional[str]    = None
-    stone:          Optional[str]    = None     # "none" = no stone
-    max_weight:     Optional[float]  = None
-    min_weight:     Optional[float]  = None
-    keywords:       list[str]        = field(default_factory=list)
-    style_keywords: list[str]        = field(default_factory=list)
-    occasion:       Optional[str]    = None
-    is_gift:        bool             = False
-    sort_by:        str              = "relevance"   # relevance | price_asc | price_desc | newest
-    available_only: bool             = True
-
-    def has_any(self) -> bool:
-        return any([
-            self.max_budget, self.min_budget, self.gender, self.category,
-            self.gold_color, self.stone, self.max_weight, self.min_weight,
-            self.keywords, self.style_keywords, self.occasion, self.is_gift,
-        ])
-
-
-# ── Keyword tables ────────────────────────────────────────────────────────────
+# ── Local (regex) keyword tables ───────────────────────────────────────────────
 
 _CATEGORY_MAP: dict[str, list[str]] = {
     "انگشتر":   ["انگشتر", "انگشتری", "حلقه"],
@@ -86,56 +72,44 @@ _STONE_MAP: dict[str, list[str]] = {
     "فیروزه":  ["فیروزه"],
 }
 
-_SORT_MAP: dict[str, list[str]] = {
-    "price_asc":  ["ارزان‌ترین", "کمترین قیمت", "ارزان تر"],
-    "price_desc": ["گران‌ترین", "بیشترین قیمت"],
-    "newest":     ["جدیدترین", "تازه‌ترین", "جدید"],
-}
-
 _STYLE_KEYWORDS: list[str] = [
     "مدرن", "کلاسیک", "ظریف", "سنگین", "حجیم",
     "لوکس", "مینیمال", "اسپرت", "شیک", "سنتی",
 ]
 
 _OCCASION_MAP: dict[str, list[str]] = {
-    "نامزدی":   ["نامزدی", "حلقه نامزدی", "عروسی", "ازدواج"],
-    "هدیه":     ["هدیه", "کادو", "پیشکش", "gift"],
-    "روزمره":   ["روزانه", "روزمره", "هر روز", "کاری"],
+    "نامزدی": ["نامزدی", "حلقه نامزدی", "عروسی", "ازدواج"],
+    "هدیه":   ["هدیه", "کادو", "پیشکش", "gift"],
+    "روزمره": ["روزانه", "روزمره", "هر روز", "کاری"],
 }
 
 
-def _extract_budget(text: str) -> tuple[Optional[float], Optional[float]]:
-    """Return (max_budget, min_budget) extracted from Persian text."""
+def _extract_budget(t: str) -> tuple[Optional[float], Optional[float]]:
     max_b = min_b = None
+    under = re.search(r"(?:زیر|تا|کمتر از)\s*([\d,]+(?:\.\d+)?)\s*میلیون", t)
+    over  = re.search(r"(?:بالای|بیشتر از)\s*([\d,]+(?:\.\d+)?)\s*میلیون", t)
+    plain = re.search(r"([\d,]+(?:\.\d+)?)\s*میلیون", t)
 
-    # Patterns: "زیر ۴۰ میلیون", "تا ۴۰ میلیون", "۴۰ میلیون"
-    under_pat = re.search(r"(?:زیر|تا|کمتر از)\s*([\d,]+(?:\.\d+)?)\s*میلیون", text)
-    over_pat  = re.search(r"(?:بالای|بیشتر از)\s*([\d,]+(?:\.\d+)?)\s*میلیون", text)
-    plain_pat = re.search(r"([\d,]+(?:\.\d+)?)\s*میلیون", text)
+    if under:
+        max_b = float(under.group(1).replace(",", "")) * 1_000_000
+    if over:
+        min_b = float(over.group(1).replace(",", "")) * 1_000_000
+    elif plain and not under:
+        max_b = float(plain.group(1).replace(",", "")) * 1_000_000
 
-    if under_pat:
-        max_b = float(under_pat.group(1).replace(",", "")) * 1_000_000
-    if over_pat:
-        min_b = float(over_pat.group(1).replace(",", "")) * 1_000_000
-    elif plain_pat and not under_pat:
-        max_b = float(plain_pat.group(1).replace(",", "")) * 1_000_000
-
-    # Direct Toman patterns: "40,000,000 تومان"
-    toman_pat = re.search(r"([\d,]+)\s*تومان", text)
-    if toman_pat and not max_b:
+    toman = re.search(r"([\d,]+)\s*تومان", t)
+    if toman and not max_b:
         try:
-            max_b = float(toman_pat.group(1).replace(",", ""))
+            max_b = float(toman.group(1).replace(",", ""))
         except ValueError:
             pass
-
     return max_b, min_b
 
 
-def _extract_weight(text: str) -> tuple[Optional[float], Optional[float]]:
-    """Return (max_weight, min_weight)."""
+def _extract_weight(t: str) -> tuple[Optional[float], Optional[float]]:
     max_w = min_w = None
-    under = re.search(r"(?:زیر|تا|کمتر از)\s*([\d.]+)\s*گرم", text)
-    over  = re.search(r"(?:بالای|بیشتر از)\s*([\d.]+)\s*گرم", text)
+    under = re.search(r"(?:زیر|تا|کمتر از)\s*([\d.]+)\s*گرم", t)
+    over  = re.search(r"(?:بالای|بیشتر از)\s*([\d.]+)\s*گرم", t)
     if under:
         max_w = float(under.group(1))
     if over:
@@ -143,146 +117,218 @@ def _extract_weight(text: str) -> tuple[Optional[float], Optional[float]]:
     return max_w, min_w
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+def local_extract(text: str) -> SearchQuery:
+    """
+    Cheap, deterministic, NO-AI-CALL extraction from a single message.
+    Used only to seed the same-turn product search before the AI runs.
+    """
+    if not text:
+        return SearchQuery()
 
-def extract_filters(text: str) -> SearchFilters:
-    """
-    Parse a natural Persian query and return a SearchFilters object.
-    Handles budgets, categories, gender, colors, stones, weight, style, and sort.
-    """
-    f = SearchFilters()
     t = text.lower()
+    q = SearchQuery()
 
-    # Budget
-    f.max_budget, f.min_budget = _extract_budget(t)
+    q.max_budget, q.min_budget = _extract_budget(t)
+    q.max_weight, q.min_weight = _extract_weight(t)
 
-    # Weight
-    f.max_weight, f.min_weight = _extract_weight(t)
-
-    # Gender
     for gender, kws in _GENDER_MAP.items():
         if any(kw in t for kw in kws):
-            f.gender = gender
+            q.gender = gender
             break
-
-    # Category
     for cat, kws in _CATEGORY_MAP.items():
         if any(kw in t for kw in kws):
-            f.category = cat
+            q.category = cat
             break
-
-    # Gold color
     for color, kws in _COLOR_MAP.items():
         if any(kw in t for kw in kws):
-            f.gold_color = color
+            q.gold_color = color
             break
-
-    # Stone
     for stone, kws in _STONE_MAP.items():
         if any(kw in t for kw in kws):
-            f.stone = stone
+            q.stone = stone
             break
-
-    # Sort preference
-    for sort_key, kws in _SORT_MAP.items():
-        if any(kw in t for kw in kws):
-            f.sort_by = sort_key
-            break
-
-    # Style keywords
-    f.style_keywords = [kw for kw in _STYLE_KEYWORDS if kw in t]
-
-    # Occasion
     for occ, kws in _OCCASION_MAP.items():
         if any(kw in t for kw in kws):
-            f.occasion = occ
-            if occ == "هدیه":
-                f.is_gift = True
+            q.occasion = occ
             break
 
-    if "هدیه" in t or "کادو" in t:
-        f.is_gift = True
+    q.style_keywords = [kw for kw in _STYLE_KEYWORDS if kw in t]
 
-    logger.debug("Extracted filters: %s", f)
-    return f
+    return q
 
 
-def filter_products(
+def build_query(profile: CustomerProfile, current_text: str = "") -> SearchQuery:
+    """
+    Combine (1) cheap local extraction from the CURRENT message with
+    (2) the customer's cumulative profile as a fallback for anything the
+    current message didn't mention. The current message always wins when
+    it explicitly says something.
+    """
+    local = local_extract(current_text)
+    return SearchQuery(
+        category       = local.category or profile.category,
+        gender         = local.gender or profile.gender,
+        gold_color     = local.gold_color or profile.gold_color,
+        stone          = local.stone or profile.stone,
+        max_budget     = local.max_budget if local.max_budget is not None else profile.max_budget,
+        min_budget     = local.min_budget if local.min_budget is not None else profile.min_budget,
+        max_weight     = local.max_weight if local.max_weight is not None else profile.max_weight,
+        min_weight     = local.min_weight if local.min_weight is not None else profile.min_weight,
+        style_keywords = local.style_keywords or profile.style_keywords,
+        occasion       = local.occasion or profile.occasion,
+    )
+
+
+# ── Relevance scoring (ranking, not just filtering) ────────────────────────────
+
+def score_product(
+    product: "Product",
+    query: SearchQuery,
+    price: float,
+    profile: Optional[CustomerProfile] = None,
+) -> float:
+    """
+    Weighted relevance score — higher is better. Combines the CURRENT
+    query with a smaller bonus for matching the customer's longer-term
+    profile, so consistently-relevant items rank higher over time.
+    """
+    score = 0.0
+
+    if query.category and product.category:
+        score += 25.0 if query.category.lower() in product.category.lower() else 0.0
+
+    if query.gender and product.gender:
+        if query.gender == product.gender:
+            score += 10.0
+        elif product.gender == "یونیسکس":
+            score += 6.0
+
+    if query.gold_color and product.gold_color:
+        score += 15.0 if query.gold_color.lower() in product.gold_color.lower() else 0.0
+
+    if query.stone:
+        if query.stone == "none":
+            if not product.stone or product.stone in ("", "بدون سنگ", "ندارد"):
+                score += 10.0
+        elif product.stone and query.stone.lower() in product.stone.lower():
+            score += 15.0
+
+    if query.occasion:
+        blob = f"{product.tags} {product.description}".lower()
+        if query.occasion.lower() in blob:
+            score += 8.0
+
+    if query.style_keywords:
+        blob = f"{product.name} {product.tags} {product.description}".lower()
+        hits = sum(1 for kw in query.style_keywords if kw.lower() in blob)
+        score += min(hits, 3) * 5.0
+
+    # Budget fit — reward affordability, penalize going over
+    if query.max_budget:
+        if price <= query.max_budget:
+            closeness = (price / query.max_budget) if query.max_budget > 0 else 0
+            score += 15.0 * closeness
+        else:
+            overshoot = (price - query.max_budget) / query.max_budget
+            score -= min(overshoot, 1.0) * 20.0
+    if query.min_budget and price < query.min_budget:
+        score -= 10.0
+
+    # Weight fit
+    if query.max_weight:
+        score += 8.0 if product.weight <= query.max_weight else -8.0
+    if query.min_weight:
+        score += 4.0 if product.weight >= query.min_weight else -4.0
+
+    # Long-term profile bonus (consistency across the whole conversation)
+    if profile:
+        if profile.category and profile.category.lower() in (product.category or "").lower():
+            score += 5.0
+        if profile.gold_color and profile.gold_color.lower() in (product.gold_color or "").lower():
+            score += 3.0
+        if profile.stone and product.stone and profile.stone.lower() in product.stone.lower():
+            score += 3.0
+
+    if product.stock > 0:
+        score += 2.0
+
+    return round(score, 2)
+
+
+def search(
     products: list["Product"],
-    filters: SearchFilters,
+    query: SearchQuery,
     gold_price: float,
+    profile: Optional[CustomerProfile] = None,
     max_results: int = MAX_SEARCH_RESULTS,
-) -> list["Product"]:
+) -> SearchResult:
     """
-    Apply filters to the product list.
-    Returns at most max_results products.
-    If nothing matches, returns the top max_results available products as fallback.
+    Score every available product, sort by relevance, return the top
+    `max_results` as a typed SearchResult. Falls back to best-available
+    products (ignoring the query) if nothing scores positively, so the AI
+    always has real products to work with.
     """
-    results: list["Product"] = []
+    from services.price_service import calculate_price
 
-    for p in products:
-        # Availability
-        if filters.available_only and not p.is_available:
-            continue
-
-        # Gender (empty gender = unisex, matches all)
-        if filters.gender and p.gender:
-            if filters.gender not in (p.gender, "یونیسکس"):
-                continue
-
-        # Category
-        if filters.category and p.category:
-            if filters.category.lower() not in p.category.lower():
-                continue
-
-        # Gold color
-        if filters.gold_color and p.gold_color:
-            if filters.gold_color.lower() not in p.gold_color.lower():
-                continue
-
-        # Stone
-        if filters.stone:
-            if filters.stone == "none":
-                if p.stone and p.stone not in ("", "بدون سنگ", "ندارد"):
-                    continue
-            else:
-                if p.stone and filters.stone.lower() not in p.stone.lower():
-                    continue
-
-        # Weight
-        if filters.max_weight and p.weight > filters.max_weight:
-            continue
-        if filters.min_weight and p.weight < filters.min_weight:
-            continue
-
-        # Budget
-        if filters.max_budget or filters.min_budget:
-            price = calculate_price(p, gold_price)
-            if filters.max_budget and price > filters.max_budget:
-                continue
-            if filters.min_budget and price < filters.min_budget:
-                continue
-
-        # Style keywords (at least one must match)
-        if filters.style_keywords:
-            blob = f"{p.name} {p.tags} {p.description}".lower()
-            if not any(kw.lower() in blob for kw in filters.style_keywords):
-                continue
-
-        results.append(p)
-
-    # Sorting
-    if filters.sort_by == "price_asc":
-        results.sort(key=lambda p: calculate_price(p, gold_price))
-    elif filters.sort_by == "price_desc":
-        results.sort(key=lambda p: calculate_price(p, gold_price), reverse=True)
-    elif filters.sort_by == "newest":
-        results.sort(key=lambda p: p.updated_at or p.created_at or "", reverse=True)
-
-    if results:
-        return results[:max_results]
-
-    # Fallback: return available products if nothing matched
-    logger.info("No products matched filters; falling back to available products.")
     available = [p for p in products if p.is_available]
-    return available[:max_results]
+    scored: list[tuple[float, "Product"]] = [
+        (score_product(p, query, calculate_price(p, gold_price), profile), p)
+        for p in available
+    ]
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+
+    positive = [pair for pair in scored if pair[0] > 0]
+    chosen = positive[:max_results] if positive else scored[:max_results]
+
+    contexts = [
+        ProductContext(
+            id=p.id, name=p.name, category=p.category, gender=p.gender,
+            gold_color=p.gold_color, stone=p.stone, weight=p.weight,
+            price=calculate_price(p, gold_price), stock=p.stock,
+            relevance_score=s,
+        )
+        for s, p in chosen
+    ]
+
+    logger.info(
+        "Search: %d available, %d positively scored, returning top %d.",
+        len(available), len(positive), len(contexts),
+    )
+    return SearchResult(products=contexts, total_matched=len(positive), query=query)
+
+
+# ── Notification similarity (follow-up system) ─────────────────────────────────
+
+def notification_similarity(product: "Product", profile: CustomerProfile, price: float) -> float:
+    """
+    Return a normalized 0..1 similarity score for restock-notification
+    matching. Stricter and more interpretable than the chat relevance
+    score above — used to decide whether to proactively message a customer.
+    """
+    if not profile.has_any_preference() or not product.is_available:
+        return 0.0
+
+    checks: list[tuple[float, bool]] = []
+
+    if profile.category:
+        checks.append((0.25, profile.category.lower() in (product.category or "").lower()))
+    if profile.gender:
+        checks.append((0.10, profile.gender == product.gender or product.gender == "یونیسکس"))
+    if profile.gold_color:
+        checks.append((0.20, profile.gold_color.lower() in (product.gold_color or "").lower()))
+    if profile.stone:
+        if profile.stone == "none":
+            checks.append((0.15, not product.stone or product.stone in ("", "بدون سنگ", "ندارد")))
+        else:
+            checks.append((0.15, bool(product.stone) and profile.stone.lower() in product.stone.lower()))
+    if profile.max_budget:
+        checks.append((0.20, price <= profile.max_budget))
+    if profile.max_weight:
+        checks.append((0.10, product.weight <= profile.max_weight))
+
+    if not checks:
+        return 0.0
+
+    total_weight   = sum(w for w, _ in checks)
+    matched_weight = sum(w for w, ok in checks if ok)
+    return round(matched_weight / total_weight, 3) if total_weight else 0.0

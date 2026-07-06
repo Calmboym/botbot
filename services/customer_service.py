@@ -1,26 +1,22 @@
 """
 Gold Bot v2 – Customer Tracking Service
 =========================================
-Manages the 'customers' worksheet which records:
-  • Every customer's Telegram ID and name
-  • Their extracted preferences / wishlist (budget, category, weight, etc.)
-  • A summary of their expressed needs (filled by AI)
-  • Whether they have opted in for restock notifications
+Persists each customer's cumulative CustomerProfile (a typed Pydantic
+model — see models/ai_models.py) to the 'customers' worksheet, and
+matches restocked/new products against every opted-in customer using a
+normalized similarity score (see search_service.notification_similarity).
 
-Columns in the 'customers' sheet:
-    user_id | name | category | gold_color | stone | max_weight |
-    max_budget | gender | style | notes | notify | last_seen | updated_at
+Sheet columns:
+    user_id | name | category | gender | gold_color | stone |
+    max_budget | min_budget | max_weight | min_weight | style_keywords |
+    occasion | shopping_stage | interest_level | notify | last_seen | updated_at
 
-The 'notify' column is either "yes" or "" (empty = no).
-
-Notification flow:
-    When the admin publishes a product (or manually triggers a check),
-    check_and_notify() is called. It loads all customers with notify="yes",
-    applies SearchService filters against the new product, and sends a
-    Telegram message to every matched customer.
+Note: this schema replaces the earlier ad-hoc 'preferences' dict-based
+sheet. If you have an existing 'customers' tab from a previous version,
+delete it (or rename it) so the bot can recreate it with the new columns
+on first use — see README "AI Architecture" section.
 """
 
-import asyncio
 import datetime
 import logging
 from typing import Optional, TYPE_CHECKING
@@ -28,27 +24,25 @@ from typing import Optional, TYPE_CHECKING
 import gspread
 
 from config.config import (
-    CUSTOMERS_SHEET, GOOGLE_SCOPES, SERVICE_ACCOUNT_FILE, SPREADSHEET_NAME,
+    CUSTOMERS_SHEET, GOOGLE_SCOPES, NOTIFICATION_SIMILARITY_THRESHOLD,
+    SERVICE_ACCOUNT_FILE, SPREADSHEET_NAME,
 )
+from models.ai_models import CustomerProfile, ShoppingStage
 
 if TYPE_CHECKING:
     from models.product import Product
-    from utils.cache import ConversationState
 
 logger = logging.getLogger(__name__)
 
-# ── Column header list (order must match sheet) ───────────────────────────────
 _HEADERS = [
-    "user_id", "name", "category", "gold_color", "stone",
-    "max_weight", "max_budget", "gender", "style", "notes",
+    "user_id", "name", "category", "gender", "gold_color", "stone",
+    "max_budget", "min_budget", "max_weight", "min_weight",
+    "style_keywords", "occasion", "shopping_stage", "interest_level",
     "notify", "last_seen", "updated_at",
 ]
 
 
 class CustomerService:
-    def __init__(self) -> None:
-        pass
-
     # ── Private helpers ───────────────────────────────────────────────────────
 
     def _ws(self) -> gspread.Worksheet:
@@ -57,16 +51,14 @@ class CustomerService:
         client = gspread.Client(auth=creds)
         ss = client.open(SPREADSHEET_NAME)
         try:
-            ws = ss.worksheet(CUSTOMERS_SHEET)
+            return ss.worksheet(CUSTOMERS_SHEET)
         except gspread.exceptions.WorksheetNotFound:
-            # Auto-create the sheet with headers on first use
             ws = ss.add_worksheet(title=CUSTOMERS_SHEET, rows=1000, cols=len(_HEADERS))
             ws.append_row(_HEADERS)
             logger.info("Created '%s' worksheet.", CUSTOMERS_SHEET)
-        return ws
+            return ws
 
     def _find_row(self, ws: gspread.Worksheet, user_id: int) -> tuple[int, Optional[dict]]:
-        """Return (row_idx, record) for a user, or (0, None) if not found."""
         records = ws.get_all_records(numericise_ignore=["all"])
         for offset, rec in enumerate(records):
             try:
@@ -76,167 +68,170 @@ class CustomerService:
                 continue
         return 0, None
 
+    def _row_from_profile(self, profile: CustomerProfile, notify: bool) -> list[str]:
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        return [
+            str(profile.user_id),
+            profile.name,
+            profile.category or "",
+            profile.gender or "",
+            profile.gold_color or "",
+            profile.stone or "",
+            str(int(profile.max_budget)) if profile.max_budget else "",
+            str(int(profile.min_budget)) if profile.min_budget else "",
+            str(profile.max_weight) if profile.max_weight else "",
+            str(profile.min_weight) if profile.min_weight else "",
+            ", ".join(profile.style_keywords),
+            profile.occasion or "",
+            profile.shopping_stage.value,
+            str(profile.interest_level),
+            "yes" if notify else "",
+            now,
+            now,
+        ]
+
+    def _profile_from_row(self, row: dict) -> CustomerProfile:
+        def _f(key: str) -> Optional[float]:
+            raw = str(row.get(key, "") or "").strip().replace(",", "")
+            try:
+                return float(raw) if raw else None
+            except ValueError:
+                return None
+
+        styles_raw = str(row.get("style_keywords", "") or "")
+        styles = [s.strip() for s in styles_raw.split(",") if s.strip()]
+
+        try:
+            stage = ShoppingStage(str(row.get("shopping_stage", "") or "browsing"))
+        except ValueError:
+            stage = ShoppingStage.BROWSING
+
+        try:
+            interest = int(str(row.get("interest_level", 0) or 0))
+        except ValueError:
+            interest = 0
+
+        return CustomerProfile(
+            user_id=int(str(row.get("user_id", 0) or 0)),
+            name=str(row.get("name", "") or ""),
+            category=row.get("category") or None,
+            gender=row.get("gender") or None,
+            gold_color=row.get("gold_color") or None,
+            stone=row.get("stone") or None,
+            max_budget=_f("max_budget"),
+            min_budget=_f("min_budget"),
+            max_weight=_f("max_weight"),
+            min_weight=_f("min_weight"),
+            style_keywords=styles,
+            occasion=row.get("occasion") or None,
+            shopping_stage=stage,
+            interest_level=interest,
+            notify_enabled=str(row.get("notify", "") or "").strip().lower() == "yes",
+            last_seen=str(row.get("last_seen", "") or ""),
+            updated_at=str(row.get("updated_at", "") or ""),
+        )
+
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def upsert_customer(
-        self,
-        user_id: int,
-        name: str,
-        conv_state: "ConversationState",
-        notes: str = "",
-        notify: bool = False,
-    ) -> None:
+    def save_profile(self, profile: CustomerProfile, notify: Optional[bool] = None) -> None:
         """
-        Insert or update a customer row with the latest preferences extracted
-        from their conversation state.
+        Insert or update a customer's profile row.
 
-        Called at the end of every AI conversation turn so the sheet always
-        reflects the customer's most up-to-date interests.
+        If `notify` is None, any existing notify flag is preserved (so a
+        routine background profile-save never accidentally un-subscribes
+        a customer from restock notifications).
+
+        Never raises — CRM write failures are logged, not fatal to chat.
         """
         try:
-            ws  = self._ws()
-            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-            p   = conv_state.preferences
+            ws = self._ws()
+            row_idx, existing = self._find_row(ws, profile.user_id)
 
-            row_data = {
-                "user_id":    str(user_id),
-                "name":       name,
-                "category":   p.category or "",
-                "gold_color": p.gold_color or "",
-                "stone":      p.stone or "",
-                "max_weight": str(p.max_weight) if p.max_weight else "",
-                "max_budget": str(int(p.budget)) if p.budget else "",
-                "gender":     p.gender or "",
-                "style":      ", ".join(p.style_keywords) if p.style_keywords else "",
-                "notes":      notes,
-                "notify":     "yes" if notify else "",
-                "last_seen":  now,
-                "updated_at": now,
-            }
+            if notify is None:
+                notify = (
+                    str(existing.get("notify", "")).strip().lower() == "yes"
+                    if existing else profile.notify_enabled
+                )
 
-            row_idx, existing = self._find_row(ws, user_id)
+            row = self._row_from_profile(profile, notify)
 
             if existing:
-                # Preserve notify flag unless we're explicitly changing it
-                if not notify and existing.get("notify") == "yes":
-                    row_data["notify"] = "yes"
-                # Preserve existing notes unless new ones provided
-                if not notes:
-                    row_data["notes"] = existing.get("notes", "")
-                # Update row in-place
-                ws.update(
-                    range_name=f"A{row_idx}",
-                    values=[[row_data[h] for h in _HEADERS]],
-                )
-                logger.debug("Updated customer row for user %d at row %d.", user_id, row_idx)
+                ws.update(range_name=f"A{row_idx}", values=[row])
+                logger.debug("Updated customer profile for user %d.", profile.user_id)
             else:
-                ws.append_row([row_data[h] for h in _HEADERS])
-                logger.info("Inserted new customer row for user %d.", user_id)
+                ws.append_row(row)
+                logger.info("Inserted new customer profile for user %d.", profile.user_id)
 
         except Exception as exc:
-            # Never let CRM write failures crash the bot
-            logger.error("Failed to upsert customer %d: %s", user_id, exc)
+            logger.error("Failed to save profile for user %d: %s", profile.user_id, exc)
+
+    def load_profile(self, user_id: int) -> Optional[CustomerProfile]:
+        """Load a customer's persisted profile from Sheets, or None if never seen."""
+        try:
+            ws = self._ws()
+            _, row = self._find_row(ws, user_id)
+            return self._profile_from_row(row) if row else None
+        except Exception as exc:
+            logger.error("Failed to load profile for user %d: %s", user_id, exc)
+            return None
 
     def set_notify(self, user_id: int, notify: bool) -> None:
-        """Toggle the restock notification flag for a customer."""
         try:
             ws = self._ws()
             row_idx, rec = self._find_row(ws, user_id)
             if not rec:
                 logger.warning("Cannot set notify for unknown user %d.", user_id)
                 return
-            notify_col = _HEADERS.index("notify") + 1
-            ws.update_cell(row_idx, notify_col, "yes" if notify else "")
+            col = _HEADERS.index("notify") + 1
+            ws.update_cell(row_idx, col, "yes" if notify else "")
             logger.info("Set notify=%s for user %d.", notify, user_id)
         except Exception as exc:
             logger.error("Failed to set notify for user %d: %s", user_id, exc)
 
-    def get_notify_customers(self) -> list[dict]:
-        """Return all customers who have opted in for restock notifications."""
+    def get_notify_profiles(self) -> list[CustomerProfile]:
+        """Return CustomerProfile objects for every customer opted into notifications."""
         try:
             ws = self._ws()
             records = ws.get_all_records(numericise_ignore=["all"])
-            return [
-                r for r in records
-                if str(r.get("notify", "") or "").strip().lower() == "yes"
-            ]
+            profiles = []
+            for r in records:
+                if str(r.get("notify", "") or "").strip().lower() == "yes":
+                    try:
+                        profiles.append(self._profile_from_row(r))
+                    except Exception as exc:
+                        logger.warning("Skipping malformed customer row: %s", exc)
+            return profiles
         except Exception as exc:
-            logger.error("Failed to load notify customers: %s", exc)
+            logger.error("Failed to load notify profiles: %s", exc)
             return []
 
     # ── Notification matching ─────────────────────────────────────────────────
 
-    def customers_matching_product(
-        self, product: "Product", gold_price: float
-    ) -> list[dict]:
+    def customers_matching_product(self, product: "Product", gold_price: float) -> list[CustomerProfile]:
         """
-        Return customers whose saved wishlist matches the given product.
-        Used after a product's stock changes from 0 → positive.
+        Return profiles whose similarity score to this product is at or
+        above NOTIFICATION_SIMILARITY_THRESHOLD.
         """
         from services.price_service import calculate_price
-        interested = []
-        price = calculate_price(product, gold_price)
+        from services.search_service import notification_similarity
 
-        for cust in self.get_notify_customers():
-            if not self._matches(cust, product, price):
-                continue
-            interested.append(cust)
+        price = calculate_price(product, gold_price)
+        matched: list[CustomerProfile] = []
+
+        for profile in self.get_notify_profiles():
+            score = notification_similarity(product, profile, price)
+            if score >= NOTIFICATION_SIMILARITY_THRESHOLD:
+                matched.append(profile)
+                logger.debug(
+                    "User %d matched product %d (similarity=%.2f).",
+                    profile.user_id, product.id, score,
+                )
 
         logger.info(
-            "Product %d ('%s') matched %d notify-customers.",
-            product.id, product.name, len(interested),
+            "Product %d ('%s') matched %d notify-customers (threshold=%.2f).",
+            product.id, product.name, len(matched), NOTIFICATION_SIMILARITY_THRESHOLD,
         )
-        return interested
-
-    def _matches(self, cust: dict, product: "Product", price: float) -> bool:
-        """Return True if the product satisfies the customer's saved preferences."""
-        def _str(k: str) -> str:
-            return str(cust.get(k, "") or "").strip().lower()
-        def _float(k: str) -> Optional[float]:
-            raw = str(cust.get(k, "") or "").strip().replace(",", "")
-            try:
-                return float(raw) if raw else None
-            except ValueError:
-                return None
-
-        # Category
-        cat = _str("category")
-        if cat and product.category and cat not in product.category.lower():
-            return False
-
-        # Gold color
-        color = _str("gold_color")
-        if color and product.gold_color and color not in product.gold_color.lower():
-            return False
-
-        # Stone
-        stone = _str("stone")
-        if stone and stone not in ("", "any", "هر"):
-            if stone == "بدون سنگ" and product.stone and product.stone not in ("", "بدون سنگ", "ندارد"):
-                return False
-            elif stone != "بدون سنگ" and product.stone and stone not in product.stone.lower():
-                return False
-
-        # Gender
-        gender = _str("gender")
-        if gender and product.gender and gender not in product.gender.lower() and product.gender.lower() != "یونیسکس":
-            return False
-
-        # Budget
-        max_budget = _float("max_budget")
-        if max_budget and price > max_budget:
-            return False
-
-        # Weight
-        max_weight = _float("max_weight")
-        if max_weight and product.weight > max_weight:
-            return False
-
-        # Product must be available
-        if not product.is_available:
-            return False
-
-        return True
+        return matched
 
 
 # ── Async notification sender ─────────────────────────────────────────────────
@@ -248,11 +243,10 @@ async def notify_interested_customers(
     customer_service: CustomerService,
 ) -> int:
     """
-    Send a restock notification to every customer whose wishlist matches
-    the given product.
-
-    Returns the number of customers successfully notified.
+    Send a restock notification to every customer whose profile matches
+    the given product. Returns the number of customers successfully notified.
     """
+    import asyncio
     from services.price_service import calculate_price
     from telegram.error import TelegramError
 
@@ -265,15 +259,7 @@ async def notify_interested_customers(
     price = calculate_price(product, gold_price)
     notified = 0
 
-    for cust in matched:
-        try:
-            uid_raw = str(cust.get("user_id", "") or "").strip()
-            if not uid_raw:
-                continue
-            uid = int(uid_raw)
-        except ValueError:
-            continue
-
+    for profile in matched:
         try:
             msg = (
                 f"🔔 *محصول مورد نظر شما موجود شد!*\n\n"
@@ -284,10 +270,10 @@ async def notify_interested_customers(
                 f"💰 قیمت تقریبی: `{price:,.0f} تومان`\n\n"
                 f"برای اطلاعات بیشتر و خرید با فروشگاه تماس بگیرید."
             )
-            await bot.send_message(chat_id=uid, text=msg, parse_mode="Markdown")
+            await bot.send_message(chat_id=profile.user_id, text=msg, parse_mode="Markdown")
             notified += 1
-            logger.info("Restock notification sent to user %d for product %d.", uid, product.id)
+            logger.info("Restock notification sent to user %d for product %d.", profile.user_id, product.id)
         except TelegramError as exc:
-            logger.warning("Could not notify user %d: %s", uid, exc)
+            logger.warning("Could not notify user %d: %s", profile.user_id, exc)
 
     return notified
