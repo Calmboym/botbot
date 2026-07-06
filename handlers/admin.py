@@ -550,9 +550,11 @@ async def _advance_add_step(msg: Message, state: AdminState, cache: Cache) -> No
             f"  • {k}: {'✅ دارد' if k == 'telegram_file_id' and v else v}"
             for k, v in state.add_data.items() if v
         )
+        # NOTE: summary contains raw admin-typed text (name, description, tags...)
+        # which may include unescaped Markdown characters (_, *, `, [ ]).
+        # No parse_mode is used here to avoid "Can't parse entities" crashes.
         await msg.reply_text(
-            f"✅ *خلاصه محصول جدید:*\n\n{summary}\n\nآیا تأیید می‌کنید؟",
-            parse_mode="Markdown",
+            f"✅ خلاصه محصول جدید:\n\n{summary}\n\nآیا تأیید می‌کنید؟",
             reply_markup=add_confirm_kb(),
         )
         return
@@ -791,7 +793,7 @@ async def cb_customers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     try:
-        all_custs = await asyncio.to_thread(cust_svc.get_notify_customers)
+        all_custs = await asyncio.to_thread(cust_svc.get_notify_profiles)
         count = len(all_custs)
     except Exception as exc:
         logger.error("Customers load error: %s", exc)
@@ -817,7 +819,7 @@ async def cb_customers_list(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         return
 
     try:
-        custs = await asyncio.to_thread(cust_svc.get_notify_customers)
+        custs = await asyncio.to_thread(cust_svc.get_notify_profiles)
     except Exception as exc:
         logger.error("Failed to load customer list: %s", exc)
         await _safe_edit(q.message, f"❌ خطا: {exc}", reply_markup=back_to_dashboard_kb())
@@ -839,13 +841,9 @@ async def cb_customers_list(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     lines = []
     for c in page_custs:
-        uid  = c.get("user_id", "")
-        name = c.get("name", "ناشناس")
-        cat  = c.get("category", "")
-        bud  = c.get("max_budget", "")
-        bud_str = f" | بودجه: {int(float(bud)):,}" if bud else ""
-        cat_str = f" | {cat}" if cat else ""
-        lines.append(f"• `{uid}` — {name}{cat_str}{bud_str}")
+        bud_str = f" | بودجه: {c.max_budget:,.0f}" if c.max_budget else ""
+        cat_str = f" | {c.category}" if c.category else ""
+        lines.append(f"• `{c.user_id}` — {c.name or 'ناشناس'}{cat_str}{bud_str}")
 
     text = (
         f"👥 *مشتریان با نوتیف فعال* ({len(custs)} نفر)\n"

@@ -1,27 +1,21 @@
 """
 Gold Bot v2 – Customer Handler
 ================================
-Handles all customer-facing interactions:
-    cmd_start              – /start welcome
-    handle_customer_text   – text → SearchService → AIService → reply (+ photos)
-    handle_customer_photo  – image → AIService (vision) → reply
+AI-driven, provider-independent customer chat flow.
 
-Product photo delivery
------------------------
-Two complementary paths send a product photo to the customer:
-
-1. FAST PATH (no AI call): the customer is in "ask about this product" mode
-   (conv_state.current_product_id is set, via the 🤖 channel button) and their
-   message contains an explicit photo-request keyword (عکس / تصویر / نشون بده …).
-   The photo is sent immediately — cheaper and faster than waiting on the AI.
-
-2. AI PATH: during normal chat, the AI is instructed (see ai_service.py) to
-   embed [IMAGE:<product_id>] markers in its reply whenever the customer asks
-   to see a specific product's photo. Those markers are parsed out by
-   AIService and the corresponding photos are sent right after the AI's text
-   reply. As a safety net, if the customer's message clearly asked for a photo
-   but the AI forgot the marker, the bot falls back to sending the photo of
-   the single best-matching product.
+Flow per message:
+    1. Cheap local checks first (fast photo path, zero AI calls).
+    2. local_extract() seeds a same-turn SearchQuery from the raw message
+       (regex, no AI call) merged with the customer's cumulative profile.
+    3. search_service.search() ranks real products by relevance — the AI
+       only ever sees this short, scored candidate list.
+    4. ONE AI call (AIService) returns a structured AIResponse: reply text,
+       support flag, image IDs, and this turn's IntentExtraction — all in
+       a single JSON response (see services/ai_service.py for why).
+    5. The extracted intent is merged (never overwritten) into the
+       customer's cumulative CustomerProfile and persisted to Sheets.
+    6. The rolling ConversationSummary is regenerated periodically instead
+       of ever sending full history to the AI.
 """
 
 import asyncio
@@ -31,51 +25,42 @@ from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
-from config.config import IMAGE_REQUEST_KEYWORDS
-from keyboards.customer_keyboard import build_support_keyboard, build_notify_keyboard
+from config.config import IMAGE_REQUEST_KEYWORDS, RECENT_MESSAGES_COUNT
+from keyboards.customer_keyboard import build_notify_keyboard, build_support_keyboard
 from services.ai_service import AIService
 from services.customer_service import CustomerService
 from services.gold_service import GoldService
+from services.price_service import calculate_price
 from services.publish_service import send_product_photo
-from services.search_service import extract_filters, filter_products
+from services.search_service import build_query, search
 from services.sheet_service import SheetService
+from services.summary_service import SummaryService
 from services.telegram_service import notify_admin_support
-from utils.cache import Cache
+from utils.cache import Cache, ConversationState
 
 logger = logging.getLogger(__name__)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _services(context: ContextTypes.DEFAULT_TYPE) -> tuple[SheetService, GoldService, AIService, Cache, CustomerService]:
+def _services(context: ContextTypes.DEFAULT_TYPE):
     return (
         context.bot_data["sheet_service"],
         context.bot_data["gold_service"],
         context.bot_data["ai_service"],
         context.bot_data["cache"],
         context.bot_data.get("customer_service"),
+        context.bot_data.get("summary_service"),
     )
 
 
 def _wants_photo(text: str) -> bool:
-    """True if the customer's message explicitly asks to see a photo."""
+    """Cheap, local, NO-AI-CALL check for an explicit photo request."""
     t = text.strip().lower()
     return any(kw in t for kw in IMAGE_REQUEST_KEYWORDS)
 
 
-def _has_specific_preference(conv_state) -> bool:
-    """True if the customer has expressed at least one specific product preference."""
-    p = conv_state.preferences
-    return any([p.budget, p.category, p.gold_color, p.stone, p.max_weight, p.gender])
-
-
-async def _send_images(
-    context: ContextTypes.DEFAULT_TYPE,
-    sheet: SheetService,
-    chat_id: int,
-    product_ids: list[int],
-) -> None:
-    """Send one or more product photos to the customer's chat, best-effort."""
+async def _send_images(context, sheet: SheetService, chat_id: int, product_ids: list[int]) -> None:
     for pid in product_ids:
         product = await asyncio.to_thread(sheet.get_product_by_id, pid)
         if product is None:
@@ -84,14 +69,46 @@ async def _send_images(
         await send_product_photo(context.bot, chat_id, product)
 
 
+async def _ensure_profile_loaded(
+    conv_state: ConversationState,
+    cust_svc: "CustomerService",
+    user_id: int,
+    user_name: str,
+) -> None:
+    """
+    On a FRESH in-memory session (new process, or conversation TTL expired)
+    the profile starts empty. Try to reload it from Google Sheets so
+    returning customers keep their preferences across sessions, not just
+    within one in-memory window — this is what makes the profile truly
+    cumulative rather than merely per-session.
+    """
+    conv_state.profile.name = user_name
+    if conv_state.profile.has_any_preference() or conv_state.profile.updated_at:
+        return  # already populated this session
+    if not cust_svc:
+        return
+    try:
+        loaded = await asyncio.to_thread(cust_svc.load_profile, user_id)
+        if loaded:
+            loaded.name = user_name
+            conv_state.profile = loaded
+            logger.info("Reloaded persisted profile for returning user %d.", user_id)
+    except Exception as exc:
+        logger.warning("Could not reload profile for user %d: %s", user_id, exc)
+
+
+async def _persist_profile(cust_svc: "CustomerService", conv_state: ConversationState) -> None:
+    if cust_svc and conv_state.profile.has_any_preference():
+        asyncio.create_task(asyncio.to_thread(cust_svc.save_profile, conv_state.profile))
+
+
 # ── /start ────────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _, _, _, cache = _services(context)
+    sheet, _, _, cache, _, _ = _services(context)
     user = update.effective_user
     cache.stats.record_message(user.id)
 
-    sheet, _, _, _ = _services(context)
     settings = await asyncio.to_thread(sheet.get_settings)
     store_name = settings.get("store_name", "فروشگاه جواهرات")
 
@@ -111,48 +128,63 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Fast path: direct photo request while focused on one product ──────────────
 
-async def _try_fast_photo_path(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    user_message: str,
-) -> bool:
-    """
-    If the customer is in "ask about this product" mode and explicitly asks
-    for a photo, send it immediately without calling the AI.
-
-    Returns True if this path handled the message (caller should stop).
-    """
-    sheet, _, _, cache, _ = _services(context)
+async def _try_fast_photo_path(update: Update, context: ContextTypes.DEFAULT_TYPE, user_message: str) -> bool:
+    """Zero-AI-call path: explicit photo keyword while focused on one product."""
+    sheet, _, _, cache, _, _ = _services(context)
     user_id = update.effective_user.id
     conv_state = cache.get_conversation(user_id)
 
-    if not conv_state.current_product_id:
-        return False
-    if not _wants_photo(user_message):
+    if not conv_state.current_product_id or not _wants_photo(user_message):
         return False
 
     product = await asyncio.to_thread(sheet.get_product_by_id, conv_state.current_product_id)
-    conv_state.current_product_id = None  # one-shot, same as the AI path
+    conv_state.current_product_id = None
 
     if product is None:
         cache.save_conversation(conv_state)
         return False
 
     sent = await send_product_photo(context.bot, update.effective_chat.id, product)
+    reply_text = (
+        f"📸 عکس «{product.name}» ارسال شد. سوال دیگری دارید؟"
+        if sent else "⚠️ متأسفم، نتوانستم تصویر این محصول را دریافت کنم."
+    )
 
-    if sent:
-        reply_text = f"📸 عکس «{product.name}» ارسال شد. سوال دیگری دارید؟"
-    else:
-        reply_text = "⚠️ متأسفم، نتوانستم تصویر این محصول را دریافت کنم."
-
-    # Keep conversation history consistent even though the AI wasn't called
-    conv_state.messages.append({"role": "user", "content": user_message})
-    conv_state.messages.append({"role": "assistant", "content": reply_text})
-    conv_state.response_count += 1
+    conv_state.recent_messages.append({"role": "user", "content": user_message})
+    conv_state.recent_messages.append({"role": "assistant", "content": reply_text})
+    conv_state.recent_messages = conv_state.recent_messages[-RECENT_MESSAGES_COUNT:]
+    conv_state.summary.messages_since_update += 2
     cache.save_conversation(conv_state)
 
     await update.message.reply_text(reply_text)
     return True
+
+
+# ── Apply one AI turn's output ─────────────────────────────────────────────────
+
+async def _apply_ai_response(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    cache: Cache,
+    conv_state: ConversationState,
+    user_message: str,
+    ai_response,
+    sheet: SheetService,
+    chat_id: int,
+) -> None:
+    """Send the reply, roll the message window, save state, send any images."""
+    await update.message.reply_text(ai_response.reply, parse_mode="Markdown")
+
+    conv_state.recent_messages.append({"role": "user", "content": user_message})
+    conv_state.recent_messages.append({"role": "assistant", "content": ai_response.reply})
+    conv_state.recent_messages = conv_state.recent_messages[-RECENT_MESSAGES_COUNT:]
+    conv_state.summary.messages_since_update += 2
+    conv_state.response_count += 1
+
+    cache.save_conversation(conv_state)
+
+    if ai_response.image_product_ids:
+        await _send_images(context, sheet, chat_id, ai_response.image_product_ids)
 
 
 # ── Main message processor ────────────────────────────────────────────────────
@@ -163,10 +195,10 @@ async def _process_ai_message(
     user_message: str,
     image_bytes: bytes | None = None,
 ) -> None:
-    sheet, gold, ai, cache, cust_svc = _services(context)
-    user      = update.effective_user
-    user_id   = user.id
-    chat_id   = update.effective_chat.id
+    sheet, gold, ai, cache, cust_svc, summary_svc = _services(context)
+    user    = update.effective_user
+    user_id = user.id
+    chat_id = update.effective_chat.id
 
     cache.stats.record_message(user_id)
 
@@ -176,113 +208,122 @@ async def _process_ai_message(
 
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
-    products_task = asyncio.to_thread(sheet.get_products)
-    faqs_task     = asyncio.to_thread(sheet.get_faqs)
-    settings_task = asyncio.to_thread(sheet.get_settings)
-    gold_task     = asyncio.to_thread(gold.get_gold_price)
     products, faqs, settings, gold_price = await asyncio.gather(
-        products_task, faqs_task, settings_task, gold_task
+        asyncio.to_thread(sheet.get_products),
+        asyncio.to_thread(sheet.get_faqs),
+        asyncio.to_thread(sheet.get_settings),
+        asyncio.to_thread(gold.get_gold_price),
     )
 
     conv_state = cache.get_conversation(user_id)
-
-    # Update accumulated preferences from this message
-    filters = extract_filters(user_message)
-    prefs   = conv_state.preferences
-    if filters.max_budget:     prefs.budget     = filters.max_budget
-    if filters.gender:         prefs.gender     = filters.gender
-    if filters.gold_color:     prefs.gold_color = filters.gold_color
-    if filters.stone:          prefs.stone      = filters.stone
-    if filters.category:       prefs.category   = filters.category
-    if filters.max_weight:     prefs.max_weight = filters.max_weight
-    if filters.occasion:       prefs.occasion   = filters.occasion
-    if filters.style_keywords: prefs.style_keywords = filters.style_keywords
+    await _ensure_profile_loaded(conv_state, cust_svc, user_id, user.full_name or str(user_id))
 
     # ── Focused "ask about this product" mode (non-photo question) ───────────
     if conv_state.current_product_id:
         product = await asyncio.to_thread(sheet.get_product_by_id, conv_state.current_product_id)
+        conv_state.current_product_id = None
+
         if product:
+            price = calculate_price(product, gold_price)
             try:
-                text, needs_support, image_ids = await ai.get_product_response(
-                    conv_state, product, gold_price, user_message, settings
+                ai_response = await ai.handle_product_question(
+                    profile=conv_state.profile,
+                    summary=conv_state.summary,
+                    recent_messages=conv_state.recent_messages,
+                    product=product,
+                    price=price,
+                    user_question=user_message,
+                    settings=settings,
                 )
             except Exception as exc:
-                logger.error("AI product response error for user %d: %s", user_id, exc)
-                text, needs_support, image_ids = (
-                    "متأسفم، در حال حاضر مشکل فنی داریم. لطفاً دوباره تلاش کنید.", False, []
+                logger.error("AI product-question error for user %d: %s", user_id, exc, exc_info=True)
+                await update.message.reply_text(
+                    "متأسفم، در حال حاضر مشکل فنی داریم. لطفاً دوباره تلاش کنید."
                 )
-            conv_state.current_product_id = None
+                return
+
+            await _apply_ai_response(update, context, cache, conv_state, user_message, ai_response, sheet, chat_id)
+            conv_state.profile = conv_state.profile.merge_intent(ai_response.intent)
             cache.save_conversation(conv_state)
+            await _persist_profile(cust_svc, conv_state)
 
-            await update.message.reply_text(text, parse_mode="Markdown")
-
-            # AI marker path
-            if image_ids:
-                await _send_images(context, sheet, chat_id, image_ids)
-            # Defensive fallback: customer asked for a photo but AI forgot the marker
-            elif _wants_photo(user_message):
-                await send_product_photo(context.bot, chat_id, product)
-
-            if needs_support:
+            if ai_response.needs_support:
                 await _escalate_to_support(update, context, user, user_message, cache)
             return
 
     # ── Normal AI chat flow ────────────────────────────────────────────────────
-    combined_filters = extract_filters(user_message)
-    if prefs.budget and not combined_filters.max_budget:
-        combined_filters.max_budget = prefs.budget
-    if prefs.gender and not combined_filters.gender:
-        combined_filters.gender = prefs.gender
-    if prefs.gold_color and not combined_filters.gold_color:
-        combined_filters.gold_color = prefs.gold_color
-    if prefs.category and not combined_filters.category:
-        combined_filters.category = prefs.category
+    query = build_query(conv_state.profile, user_message)
+    search_result = search(products, query, gold_price, conv_state.profile)
+    product_lines = [p.as_ai_line() for p in search_result.products]
 
-    matching = filter_products(products, combined_filters, gold_price)
-    logger.info("User %d | '%s' | %d matching products", user_id, user_message[:50], len(matching))
+    logger.info(
+        "User %d | '%s' | %d products in context",
+        user_id, user_message[:50], len(product_lines),
+    )
 
     try:
-        text, needs_support, image_ids = await ai.get_response(
-            conv_state, user_message, matching, gold_price, faqs, settings, image_bytes
+        ai_response = await ai.handle_message(
+            profile=conv_state.profile,
+            summary=conv_state.summary,
+            recent_messages=conv_state.recent_messages,
+            user_message=user_message,
+            product_lines=product_lines,
+            faqs=faqs,
+            settings=settings,
+            image_bytes=image_bytes,
         )
     except Exception as exc:
-        logger.error("AI error for user %d: %s", user_id, exc)
-        text, needs_support, image_ids = (
-            "⚠️ در حال حاضر مشکل فنی داریم. لطفاً چند لحظه دیگر تلاش کنید.", False, []
+        logger.error("AI error for user %d: %s", user_id, exc, exc_info=True)
+        await update.message.reply_text(
+            "⚠️ در حال حاضر مشکل فنی داریم. لطفاً چند لحظه دیگر تلاش کنید."
         )
+        return
+
+    await _apply_ai_response(update, context, cache, conv_state, user_message, ai_response, sheet, chat_id)
+
+    # ── Merge this turn's extracted intent into the cumulative profile ────────
+    conv_state.profile = conv_state.profile.merge_intent(ai_response.intent)
+
+    # ── Defensive local fallback: customer clearly asked for a photo but ─────
+    # the AI didn't include an image_product_ids entry.
+    if (
+        not ai_response.image_product_ids
+        and image_bytes is None
+        and _wants_photo(user_message)
+        and search_result.products
+    ):
+        fallback_product = await asyncio.to_thread(sheet.get_product_by_id, search_result.products[0].id)
+        if fallback_product:
+            await send_product_photo(context.bot, chat_id, fallback_product)
+
+    # ── Update rolling summary if enough messages have accumulated ───────────
+    if summary_svc:
+        conv_state.summary = await summary_svc.maybe_update(conv_state.summary, conv_state.recent_messages)
 
     cache.save_conversation(conv_state)
+    await _persist_profile(cust_svc, conv_state)
 
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-    # ── Send product photo(s) ──────────────────────────────────────────────────
-    if image_ids:
-        await _send_images(context, sheet, chat_id, image_ids)
-    elif image_bytes is None and _wants_photo(user_message) and len(matching) >= 1:
-        await _send_images(context, sheet, chat_id, [matching[0].id])
-
-    # ── Save customer interests to Google Sheets (background, non-blocking) ───
-    if cust_svc and conv_state.preferences.to_text() != "بدون ترجیح خاص":
-        asyncio.create_task(asyncio.to_thread(
-            cust_svc.upsert_customer,
-            user_id,
-            user.full_name or str(user_id),
-            conv_state,
-        ))
-
-    # ── Offer restock notification if customer showed clear product interest ──
-    if (
-        not needs_support
+    # ── Offer restock notification (follow-up system) ─────────────────────────
+    # Triggered immediately by explicit request or high purchase-readiness,
+    # otherwise offered periodically once the customer has shown any
+    # concrete preference.
+    show_notify_offer = (
+        not ai_response.needs_support
         and not conv_state.support_requested
-        and _has_specific_preference(conv_state)
-        and conv_state.response_count % 5 == 0   # show offer every 5 turns
-    ):
+        and not conv_state.profile.notify_enabled
+        and (
+            ai_response.intent.wants_notification
+            or ai_response.intent.purchase_readiness >= 70
+            or (conv_state.profile.has_any_preference() and conv_state.response_count % 5 == 0)
+        )
+    )
+    if show_notify_offer:
         await update.message.reply_text(
             "🔔 می‌خواهید وقتی محصول مورد نظرتان موجود شد، به شما اطلاع دهیم؟",
             reply_markup=build_notify_keyboard(),
         )
 
-    if needs_support:
+    if ai_response.needs_support:
         await _escalate_to_support(update, context, user, user_message, cache)
 
 
@@ -318,7 +359,7 @@ async def handle_customer_text(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_customer_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Download the highest-resolution photo the customer sent and pass it to
-    the AI with any accompanying caption text.
+    the AI (vision model) with any accompanying caption text.
     """
     caption = update.message.caption or "تصویری ارسال کردم. محصول مشابه دارید؟"
 

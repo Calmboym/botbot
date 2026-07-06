@@ -270,13 +270,10 @@ async def _route_customer(update: Update, context: ContextTypes.DEFAULT_TYPE, da
             return
         try:
             conv = cache.get_conversation(uid)
-            await asyncio.to_thread(
-                cust_svc.upsert_customer,
-                uid,
-                query.from_user.full_name or str(uid),
-                conv,
-                notify=notify,
-            )
+            conv.profile.name = query.from_user.full_name or str(uid)
+            conv.profile.notify_enabled = notify
+            cache.save_conversation(conv)
+            await asyncio.to_thread(cust_svc.save_profile, conv.profile, notify=notify)
             if notify:
                 await query.answer(
                     "✅ ثبت شد! هر وقت محصول مناسبی موجود شد، خبرتان می‌دهیم.",
