@@ -3,10 +3,22 @@ Gold Bot v2 – In-Memory Cache
 ================================
 Provides:
     TTLCache            – generic key/value store with expiry
-    ConversationState   – per-user chat state (Groq messages history + preferences)
+    ConversationState   – per-user chat state: recent messages + rolling
+                           summary + cumulative CustomerProfile (all typed
+                           Pydantic models — see models/ai_models.py)
     AdminState          – admin panel flow state (multi-step actions)
     BotStats            – simple runtime statistics (users, messages)
     Cache               – top-level singleton that holds all of the above
+
+Design note on conversation memory:
+    We deliberately do NOT store the full message history. Each
+    ConversationState keeps only:
+        - recent_messages  (a short rolling window, see RECENT_MESSAGES_COUNT)
+        - summary          (a ConversationSummary regenerated periodically)
+        - profile          (a cumulative CustomerProfile, merged — never
+                             wholesale overwritten — every turn)
+    This keeps AI token usage bounded regardless of how long a conversation
+    runs, while the CustomerProfile ensures nothing important is ever lost.
 """
 
 import logging
@@ -14,6 +26,8 @@ import time
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any, Optional
+
+from models.ai_models import ConversationSummary, CustomerProfile
 
 logger = logging.getLogger(__name__)
 
@@ -68,51 +82,27 @@ class TTLCache:
 # ── Conversation State ─────────────────────────────────────────────────────────
 
 @dataclass
-class Preferences:
-    """Customer preferences extracted from conversation."""
-    budget:         Optional[float] = None
-    gender:         Optional[str]   = None
-    gold_color:     Optional[str]   = None
-    stone:          Optional[str]   = None
-    category:       Optional[str]   = None
-    max_weight:     Optional[float] = None
-    style_keywords: list[str]       = field(default_factory=list)
-    occasion:       Optional[str]   = None
-
-    def to_text(self) -> str:
-        parts = []
-        if self.budget:
-            parts.append(f"بودجه تا {self.budget:,.0f} تومان")
-        if self.gender:
-            parts.append(f"جنسیت: {self.gender}")
-        if self.gold_color:
-            parts.append(f"رنگ طلا: {self.gold_color}")
-        if self.stone:
-            parts.append(f"سنگ: {self.stone}")
-        if self.category:
-            parts.append(f"دسته: {self.category}")
-        if self.max_weight:
-            parts.append(f"وزن حداکثر {self.max_weight} گرم")
-        if self.occasion:
-            parts.append(f"مناسبت: {self.occasion}")
-        if self.style_keywords:
-            parts.append(f"سبک: {', '.join(self.style_keywords)}")
-        return " | ".join(parts) if parts else "بدون ترجیح خاص"
-
-
-@dataclass
 class ConversationState:
     """
     Per-user state stored for the lifetime of a conversation.
-    messages: list of {role, content} dicts — the Groq chat history.
+
+    recent_messages: short rolling window of {role, content} dicts sent
+                      directly to the AI provider (see RECENT_MESSAGES_COUNT).
+    summary:          a ConversationSummary, regenerated periodically by
+                      SummaryService so older context isn't lost even
+                      though recent_messages is capped.
+    profile:          the cumulative CustomerProfile — merged every turn,
+                      never overwritten wholesale, persisted to Google
+                      Sheets by CustomerService.
     """
-    user_id:            int
-    messages:           list          = field(default_factory=list)   # Groq chat history
-    response_count:     int           = 0
-    preferences:        Preferences   = field(default_factory=Preferences)
-    support_requested:  bool          = False
-    current_product_id: Optional[int] = None   # "Ask about this product" context
-    last_activity:      float         = field(default_factory=time.monotonic)
+    user_id:             int
+    recent_messages:     list                = field(default_factory=list)
+    summary:             ConversationSummary = field(default_factory=ConversationSummary)
+    profile:             CustomerProfile     = field(default_factory=CustomerProfile)
+    response_count:      int                 = 0
+    support_requested:   bool                = False
+    current_product_id:  Optional[int]       = None
+    last_activity:        float              = field(default_factory=time.monotonic)
 
     def touch(self) -> None:
         self.last_activity = time.monotonic()
@@ -180,13 +170,24 @@ class Cache:
     # ── Conversation ──────────────────────────────────────────────────────────
 
     def get_conversation(self, user_id: int) -> ConversationState:
+        """
+        Return the in-memory ConversationState for a user, creating a fresh
+        one (with a correctly-scoped profile/summary) if it doesn't exist
+        or has expired.
+
+        Note: this does NOT reload the persisted CustomerProfile from
+        Google Sheets — that's done explicitly in the customer handler on
+        first contact of a fresh in-memory session, since it requires an
+        async network call that this synchronous, lock-holding method
+        cannot perform.
+        """
         with self._lock:
             state = self._conversations.get(user_id)
-            if state is None:
+            expired = state is not None and (time.monotonic() - state.last_activity > self.conv_ttl)
+            if state is None or expired:
                 state = ConversationState(user_id=user_id)
-                self._conversations[user_id] = state
-            elif time.monotonic() - state.last_activity > self.conv_ttl:
-                state = ConversationState(user_id=user_id)
+                state.profile.user_id = user_id
+                state.summary.user_id = user_id
                 self._conversations[user_id] = state
             return state
 
@@ -196,8 +197,12 @@ class Cache:
             self._conversations[state.user_id] = state
 
     def reset_conversation(self, user_id: int) -> None:
+        """Full reset, including the cumulative profile. Use sparingly."""
         with self._lock:
-            self._conversations[user_id] = ConversationState(user_id=user_id)
+            state = ConversationState(user_id=user_id)
+            state.profile.user_id = user_id
+            state.summary.user_id = user_id
+            self._conversations[user_id] = state
 
     # ── Admin state ───────────────────────────────────────────────────────────
 
