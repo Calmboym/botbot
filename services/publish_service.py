@@ -8,8 +8,18 @@ Image approach: Telegram file_id
     The bot uses product.telegram_file_id (a Telegram-native file identifier)
     for all photo sends. No external hosting, no URL downloads, no Drive.
     Telegram stores the file; we only store its identifier in Google Sheets.
+
+Caption assembly (Features 1, 2, 4)
+    The channel post caption is built by services.caption_service.build_caption(),
+    which combines:
+      - the admin's per-product attribute selection (Feature 1)
+      - the resolved currency label, never hardcoded (Feature 4)
+      - the global footer text, appended only if non-empty (Feature 2)
+    Settings (currency, post_footer) are read fresh from Sheets on every
+    publish so admin changes take effect immediately, with no caching lag.
 """
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -19,7 +29,8 @@ from telegram.error import TelegramError
 from config.config import CHANNEL_USERNAME
 from keyboards.customer_keyboard import build_product_keyboard
 from models.product import Product
-from services.price_service import calculate_price
+from services.caption_service import build_caption
+from services.price_service import calculate_price, currency_label
 from services.sheet_service import SheetService
 
 logger = logging.getLogger(__name__)
@@ -30,9 +41,18 @@ async def publish_product(
     product: Product,
     gold_price: float,
     sheet_service: SheetService,
+    selected_attrs: Optional[set] = None,
 ) -> Message:
     """
     Publish a product photo post to the configured Telegram channel.
+
+    Args:
+        selected_attrs: Which attributes to show under this post (Feature 1
+                         — per-product, chosen by the admin just before
+                         publishing). None falls back to
+                         config.DEFAULT_PUBLISH_ATTRS, keeping the caption
+                         identical to the pre-Feature-1 behaviour for any
+                         caller that doesn't customize it.
 
     Uses product.telegram_file_id — the file_id stored when the admin
     originally sent the photo to the bot. No download or re-upload needed.
@@ -48,7 +68,12 @@ async def publish_product(
             "لطفاً ابتدا از منوی ویرایش، عکس محصول را ارسال کنید."
         )
 
-    caption  = product.channel_caption()
+    settings = await asyncio.to_thread(sheet_service.get_settings)
+    currency = currency_label(settings)
+    footer   = settings.get("post_footer", "")
+    price    = calculate_price(product, gold_price)
+
+    caption  = build_caption(product, price, selected_attrs, currency, footer)
     keyboard = build_product_keyboard(product.id)
 
     try:
@@ -68,7 +93,6 @@ async def publish_product(
 
     # Write message_id back to Sheets (non-fatal)
     try:
-        import asyncio
         await asyncio.to_thread(
             sheet_service.update_published_message_id,
             product.id,
@@ -81,8 +105,9 @@ async def publish_product(
         )
 
     logger.info(
-        "Product %d ('%s') published to %s (msg_id=%d).",
+        "Product %d ('%s') published to %s (msg_id=%d, attrs=%s).",
         product.id, product.name, CHANNEL_USERNAME, message.message_id,
+        selected_attrs or "default",
     )
     return message
 
@@ -95,6 +120,12 @@ async def send_product_photo(
 ) -> bool:
     """
     Send a product photo directly to a customer's private chat.
+
+    This is used by the AI assistant to share a product photo mid-conversation
+    — a distinct flow from publish_product() above (channel posts), so it
+    intentionally keeps using the simple, fixed product.channel_caption()
+    (no per-post attribute selection or footer) unless an explicit caption
+    is passed in.
 
     Uses product.telegram_file_id — no download, no re-upload, no Drive.
     Returns True on success, False on failure (logged but never raised).

@@ -141,10 +141,12 @@ class AIService:
         settings: dict,
     ) -> AIResponse:
         """Focused single-product Q&A (triggered by the 🤖 channel button)."""
+        from services.price_service import currency_label
+        currency = currency_label(settings)
         system_prompt = self._build_system_prompt(settings, profile, summary)
         context = (
-            f"[محصول مورد نظر مشتری]\n{product.admin_detail()}\n"
-            f"قیمت تقریبی: {price:,.0f} تومان\n"
+            f"[محصول مورد نظر مشتری]\n{product.admin_detail(currency=currency)}\n"
+            f"قیمت تقریبی: {price:,.0f} {currency}\n"
             f"شناسه این محصول برای image_product_ids: {product.id}\n\n"
             f"---\nپیام مشتری: {user_question}"
         )
@@ -219,9 +221,10 @@ class AIService:
         profile: "CustomerProfile",
         summary: "ConversationSummary",
     ) -> str:
+        from services.price_service import currency_label
         store_name  = settings.get("store_name", "فروشگاه جواهرات")
         store_phone = settings.get("store_phone", "")
-        currency    = settings.get("currency", "تومان")
+        currency    = currency_label(settings)
         phone_line  = f"\nتلفن: {store_phone}" if store_phone else ""
         summary_block = summary.summary_text or "هنوز خلاصه‌ای ثبت نشده."
 
@@ -234,7 +237,7 @@ class AIService:
 واحد پول: {currency}
 
 **پروفایل انباشته مشتری (از کل تاریخچه مکالمات):**
-{profile.summary_text()}
+{profile.summary_text(currency=currency)}
 
 **خلاصه مکالمه تا این لحظه:**
 {summary_block}

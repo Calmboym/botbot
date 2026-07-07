@@ -241,12 +241,19 @@ async def notify_interested_customers(
     product: "Product",
     gold_price: float,
     customer_service: CustomerService,
+    currency: str = "تومان",
 ) -> int:
     """
     Send a restock notification to every customer whose profile matches
     the given product. Returns the number of customers successfully notified.
+
+    Args:
+        currency: Resolved currency label (see services.price_service.currency_label).
+                   Defaults to Toman only for backward compatibility with any
+                   caller that doesn't pass it — the admin panel always does.
     """
     import asyncio
+    from models.product import _md_escape
     from services.price_service import calculate_price
     from telegram.error import TelegramError
 
@@ -263,11 +270,11 @@ async def notify_interested_customers(
         try:
             msg = (
                 f"🔔 *محصول مورد نظر شما موجود شد!*\n\n"
-                f"💍 {product.name}\n"
-                f"🎨 {product.gold_color or '—'} | {product.purity}\n"
-                f"💎 {product.stone or 'بدون سنگ'}\n"
+                f"💍 {_md_escape(product.name)}\n"
+                f"🎨 {_md_escape(product.gold_color) or '—'} | {_md_escape(product.purity)}\n"
+                f"💎 {_md_escape(product.stone) if product.stone else 'بدون سنگ'}\n"
                 f"⚖️ {product.weight} گرم\n"
-                f"💰 قیمت تقریبی: `{price:,.0f} تومان`\n\n"
+                f"💰 قیمت تقریبی: `{price:,.0f} {currency}`\n\n"
                 f"برای اطلاعات بیشتر و خرید با فروشگاه تماس بگیرید."
             )
             await bot.send_message(chat_id=profile.user_id, text=msg, parse_mode="Markdown")
