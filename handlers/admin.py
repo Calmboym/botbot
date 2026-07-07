@@ -23,15 +23,17 @@ from telegram.error import TelegramError
 from config.config import ADMIN_ID
 from keyboards.admin_keyboard import (
     dashboard_kb, products_list_kb, product_actions_kb,
-    publish_confirm_kb, edit_groups_kb, edit_fields_kb,
+    publish_confirm_kb, publish_attrs_kb, edit_groups_kb, edit_fields_kb,
     edit_field_options_kb, delete_confirm_kb,
     add_category_kb, add_gender_kb, add_gold_color_kb,
     add_stone_kb, add_confirm_kb, gold_price_kb,
     settings_kb, support_list_kb, support_chat_kb, back_to_dashboard_kb,
 )
-from models.product import Product
+from models.product import Product, _md_escape
+from services.caption_service import build_caption
 from services.customer_service import CustomerService
 from services.gold_service import GoldService
+from services.price_service import calculate_price, currency_label
 from services.publish_service import publish_product
 from services.sheet_service import SheetService
 from services.telegram_service import format_statistics, send_admin_reply_to_customer
@@ -99,7 +101,7 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
     elif state.action == "edit" and state.step == "waiting_value":
         await _apply_edit_value(update, context, state, text, sheet, cache)
     elif state.action == "goldprice_manual":
-        await _apply_gold_price_manual(update, context, state, text, gold, cache)
+        await _apply_gold_price_manual(update, context, state, text, gold, sheet, cache)
     elif state.action == "settings_edit" and state.step == "waiting_value":
         await _apply_settings_value(update, context, state, text, sheet, cache)
     elif state.action == "reply":
@@ -214,12 +216,15 @@ async def cb_product_select(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if not product:
         await q.answer("⚠️ محصول یافت نشد.", show_alert=True)
         return
-    gp = await asyncio.to_thread(gold.get_gold_price)
-    from services.price_service import calculate_price
-    price = calculate_price(product, gp)
+    gp, settings = await asyncio.gather(
+        asyncio.to_thread(gold.get_gold_price),
+        asyncio.to_thread(sheet.get_settings),
+    )
+    price    = calculate_price(product, gp)
+    currency = currency_label(settings)
     text = (
-        product.admin_detail()
-        + f"\n\n💵 *قیمت تقریبی: `{price:,.0f} تومان`*"
+        product.admin_detail(currency=currency)
+        + f"\n\n💵 *قیمت تقریبی: `{price:,.0f} {currency}`*"
     )
     await _safe_edit(q.message, text, parse_mode="Markdown", reply_markup=product_actions_kb(product_id))
 
@@ -246,35 +251,126 @@ async def cb_publish_list(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def cb_publish_preview(update: Update, context: ContextTypes.DEFAULT_TYPE, product_id: int) -> None:
-    sheet, gold, _ = _services(context)
+    """
+    Step 1 of publishing — Feature 1: let the admin choose which attributes
+    appear under THIS product's post (per-product, never global).
+
+    Note: this function is triggered by the `a:pub:<id>` callback (product
+    selected from the publish list) and now shows the attribute checklist
+    instead of jumping straight to the preview — the old single-step flow
+    became a two-step flow: checklist → preview → confirm.
+    """
+    sheet, _, cache = _services(context)
     q = update.callback_query
     product = await asyncio.to_thread(sheet.get_product_by_id, product_id)
     if not product:
         await q.answer("⚠️ محصول یافت نشد.", show_alert=True)
         return
-    gp    = await asyncio.to_thread(gold.get_gold_price)
-    from services.price_service import calculate_price
-    price = calculate_price(product, gp)
-    text  = (
-        f"*👁 پیش‌نمایش پست کانال*\n\n"
-        f"{product.admin_detail()}\n\n"
-        f"💵 قیمت تقریبی: `{price:,.0f} تومان`\n\n"
+
+    from config.config import DEFAULT_PUBLISH_ATTRS
+    state = cache.get_admin_state()
+    if state.product_id != product_id or not state.publish_attrs:
+        state.publish_attrs = set(DEFAULT_PUBLISH_ATTRS)
+    state.action     = "publish_attrs"
+    state.product_id = product_id
+    cache.save_admin_state(state)
+
+    await _safe_edit(
+        q.message,
+        f"📢 *انتخاب اطلاعات نمایشی برای «{_md_escape(product.name)}»*\n\n"
+        "کدام مشخصات زیر پست این محصول نشان داده شود؟\n"
+        "_(این انتخاب فقط برای همین محصول است)_",
+        parse_mode="Markdown",
+        reply_markup=publish_attrs_kb(product_id, state.publish_attrs),
+    )
+
+
+async def cb_publish_attr_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, product_id: int, attr_key: str) -> None:
+    """Toggle one attribute on/off for the product currently being published (Feature 1)."""
+    from config.config import PUBLISH_ATTRIBUTES
+
+    sheet, _, cache = _services(context)
+    q = update.callback_query
+
+    if attr_key not in PUBLISH_ATTRIBUTES:
+        await q.answer("⚠️ فیلد نامعتبر.", show_alert=True)
+        return
+
+    state = cache.get_admin_state()
+    if state.product_id != product_id:
+        await q.answer("⚠️ لطفاً دوباره از لیست محصولات شروع کنید.", show_alert=True)
+        return
+
+    if attr_key in state.publish_attrs:
+        state.publish_attrs.discard(attr_key)
+    else:
+        state.publish_attrs.add(attr_key)
+    cache.save_admin_state(state)
+
+    product = await asyncio.to_thread(sheet.get_product_by_id, product_id)
+    name = _md_escape(product.name) if product else str(product_id)
+
+    await _safe_edit(
+        q.message,
+        f"📢 *انتخاب اطلاعات نمایشی برای «{name}»*\n\n"
+        "کدام مشخصات زیر پست این محصول نشان داده شود؟\n"
+        "_(این انتخاب فقط برای همین محصول است)_",
+        parse_mode="Markdown",
+        reply_markup=publish_attrs_kb(product_id, state.publish_attrs),
+    )
+
+
+async def cb_publish_go(update: Update, context: ContextTypes.DEFAULT_TYPE, product_id: int) -> None:
+    """
+    Step 2 of publishing — show the EXACT caption that will be posted
+    (selected attributes + resolved currency + global footer already
+    applied), then ask for final confirmation.
+    """
+    sheet, gold, cache = _services(context)
+    q = update.callback_query
+    product = await asyncio.to_thread(sheet.get_product_by_id, product_id)
+    if not product:
+        await q.answer("⚠️ محصول یافت نشد.", show_alert=True)
+        return
+
+    state = cache.get_admin_state()
+    selected_attrs = set(state.publish_attrs) if state.product_id == product_id and state.publish_attrs else None
+
+    gp, settings = await asyncio.gather(
+        asyncio.to_thread(gold.get_gold_price),
+        asyncio.to_thread(sheet.get_settings),
+    )
+    price    = calculate_price(product, gp)
+    currency = currency_label(settings)
+    footer   = settings.get("post_footer", "")
+
+    caption = build_caption(product, price, selected_attrs, currency, footer)
+
+    text = (
+        f"*👁 پیش‌نمایش دقیق پست کانال*\n\n"
+        f"{caption}\n\n"
+        f"──────────\n"
         f"⚠️ آیا این محصول را در کانال منتشر می‌کنید؟"
     )
     await _safe_edit(q.message, text, parse_mode="Markdown", reply_markup=publish_confirm_kb(product_id))
 
 
 async def cb_publish_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, product_id: int) -> None:
-    sheet, gold, _ = _services(context)
+    sheet, gold, cache = _services(context)
     q = update.callback_query
     await _safe_edit(q.message, f"⏳ در حال انتشار محصول {product_id} …")
     product = await asyncio.to_thread(sheet.get_product_by_id, product_id)
     if not product:
         await _safe_edit(q.message, "⚠️ محصول یافت نشد.", reply_markup=back_to_dashboard_kb())
         return
+
+    state = cache.get_admin_state()
+    selected_attrs = set(state.publish_attrs) if state.product_id == product_id and state.publish_attrs else None
+
     gp = await asyncio.to_thread(gold.get_gold_price)
     try:
-        msg = await publish_product(context.bot, product, gp, sheet)
+        msg = await publish_product(context.bot, product, gp, sheet, selected_attrs=selected_attrs)
+        cache.clear_admin_state()
         await _safe_edit(
             q.message,
             f"✅ محصول «{product.name}» منتشر شد.\n🔖 شناسه پیام: `{msg.message_id}`",
@@ -615,14 +711,18 @@ async def cb_add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ── Gold price ────────────────────────────────────────────────────────────────
 
 async def cb_gold_price_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _, gold, _ = _services(context)
+    sheet, gold, _ = _services(context)
     q = update.callback_query
-    price = await asyncio.to_thread(gold.get_gold_price)
-    upd   = await asyncio.to_thread(gold.get_last_update)
+    price, upd, settings = await asyncio.gather(
+        asyncio.to_thread(gold.get_gold_price),
+        asyncio.to_thread(gold.get_last_update),
+        asyncio.to_thread(sheet.get_settings),
+    )
+    currency = currency_label(settings)
     await _safe_edit(
         q.message,
         f"🪙 *بروزرسانی قیمت طلا*\n\n"
-        f"قیمت فعلی: `{price:,.0f} تومان/گرم`\n"
+        f"قیمت فعلی: `{price:,.0f} {currency}/گرم`\n"
         f"آخرین بروزرسانی: `{upd}`\n\n"
         "روش بروزرسانی را انتخاب کنید:",
         parse_mode="Markdown",
@@ -631,16 +731,18 @@ async def cb_gold_price_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def cb_gold_price_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _, gold, _ = _services(context)
+    sheet, gold, _ = _services(context)
     q = update.callback_query
     await _safe_edit(q.message, "⏳ در حال دریافت قیمت از tgju.org …")
     try:
         from services.gold_service import GoldService
         new_price = await asyncio.to_thread(GoldService.scrape_with_retry)
         await asyncio.to_thread(gold.update_gold_price, new_price)
+        settings = await asyncio.to_thread(sheet.get_settings)
+        currency = currency_label(settings)
         await _safe_edit(
             q.message,
-            f"✅ قیمت طلا به `{new_price:,.0f} تومان/گرم` بروزرسانی شد.",
+            f"✅ قیمت طلا به `{new_price:,.0f} {currency}/گرم` بروزرسانی شد.",
             parse_mode="Markdown",
             reply_markup=back_to_dashboard_kb(),
         )
@@ -650,23 +752,30 @@ async def cb_gold_price_scrape(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def cb_gold_price_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _, _, cache = _services(context)
+    sheet, _, cache = _services(context)
     q = update.callback_query
+    settings = await asyncio.to_thread(sheet.get_settings)
+    currency = currency_label(settings)
     state = cache.get_admin_state()
     state.action = "goldprice_manual"
     cache.save_admin_state(state)
-    await _safe_edit(q.message, "✏️ قیمت جدید طلا را وارد کنید (تومان/گرم):", reply_markup=back_to_dashboard_kb())
+    await _safe_edit(q.message, f"✏️ قیمت جدید طلا را وارد کنید ({currency}/گرم):", reply_markup=back_to_dashboard_kb())
 
 
-async def _apply_gold_price_manual(update, context, state: AdminState, text: str, gold: GoldService, cache: Cache) -> None:
-    ok, price, err = validate_gold_price(text)
+async def _apply_gold_price_manual(
+    update, context, state: AdminState, text: str,
+    gold: GoldService, sheet: SheetService, cache: Cache,
+) -> None:
+    settings = await asyncio.to_thread(sheet.get_settings)
+    currency = currency_label(settings)
+    ok, price, err = validate_gold_price(text, currency=currency)
     if not ok:
         await update.message.reply_text(f"⚠️ {err}")
         return
     await asyncio.to_thread(gold.update_gold_price, price)
     cache.clear_admin_state()
     await update.message.reply_text(
-        f"✅ قیمت طلا به `{price:,.0f} تومان/گرم` تنظیم شد.",
+        f"✅ قیمت طلا به `{price:,.0f} {currency}/گرم` تنظیم شد.",
         parse_mode="Markdown",
         reply_markup=back_to_dashboard_kb(),
     )
@@ -699,10 +808,23 @@ async def cb_settings_field(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     state.step       = "waiting_value"
     state.field_name = field
     cache.save_admin_state(state)
-    from config.config import FIELD_LABELS
-    label = {"store_name": "نام فروشگاه", "store_phone": "تلفن",
-              "store_address": "آدرس", "currency": "واحد پول"}.get(field, field)
-    await _safe_edit(q.message, f"⚙️ مقدار جدید برای «{label}» را وارد کنید:", reply_markup=back_to_dashboard_kb())
+    label = {
+        "store_name":    "نام فروشگاه",
+        "store_phone":   "تلفن",
+        "store_address": "آدرس",
+        "currency":      "واحد پول (مثلاً toman یا rial)",
+        "post_footer":   "متن پایانی پست‌ها",
+    }.get(field, field)
+    hint = (
+        "\n\nاین متن در انتهای هر پست محصول در کانال اضافه می‌شود.\n"
+        "برای حذف کامل، یک فاصله خالی ارسال کنید."
+        if field == "post_footer" else ""
+    )
+    await _safe_edit(
+        q.message,
+        f"⚙️ مقدار جدید برای «{label}» را وارد کنید:{hint}",
+        reply_markup=back_to_dashboard_kb(),
+    )
 
 
 async def _apply_settings_value(update, context, state: AdminState, text: str, sheet: SheetService, cache: Cache) -> None:
@@ -894,9 +1016,12 @@ async def cb_customers_notify_preview(update: Update, context: ContextTypes.DEFA
         await q.answer("⚠️ محصول یافت نشد.", show_alert=True)
         return
 
-    gp = await asyncio.to_thread(gold.get_gold_price)
-    from services.price_service import calculate_price
-    price = calculate_price(product, gp)
+    gp, settings = await asyncio.gather(
+        asyncio.to_thread(gold.get_gold_price),
+        asyncio.to_thread(sheet.get_settings),
+    )
+    price    = calculate_price(product, gp)
+    currency = currency_label(settings)
 
     cust_svc: "CustomerService" = context.bot_data.get("customer_service")
     matched = 0
@@ -908,8 +1033,8 @@ async def cb_customers_notify_preview(update: Update, context: ContextTypes.DEFA
 
     text = (
         f"📢 *پیش‌نمایش نوتیف*\n\n"
-        f"محصول: *{product.name}*\n"
-        f"قیمت تقریبی: `{price:,.0f} تومان`\n\n"
+        f"محصول: *{_md_escape(product.name)}*\n"
+        f"قیمت تقریبی: `{price:,.0f} {currency}`\n\n"
         f"👥 مشتریان مرتبط که نوتیف دریافت می‌کنند: `{matched}` نفر\n\n"
         "آیا نوتیف ارسال شود؟"
     )
@@ -927,7 +1052,10 @@ async def cb_customers_notify_confirm(update: Update, context: ContextTypes.DEFA
         await _safe_edit(q.message, "⚠️ محصول یافت نشد.", reply_markup=back_to_dashboard_kb())
         return
 
-    gp = await asyncio.to_thread(gold.get_gold_price)
+    gp, settings = await asyncio.gather(
+        asyncio.to_thread(gold.get_gold_price),
+        asyncio.to_thread(sheet.get_settings),
+    )
     cust_svc: "CustomerService" = context.bot_data.get("customer_service")
     if not cust_svc:
         await _safe_edit(q.message, "⚠️ سرویس مشتریان در دسترس نیست.", reply_markup=back_to_dashboard_kb())
@@ -935,10 +1063,10 @@ async def cb_customers_notify_confirm(update: Update, context: ContextTypes.DEFA
 
     await _safe_edit(q.message, "⏳ در حال ارسال نوتیف‌ها …")
     try:
-        count = await notify_interested_customers(context.bot, product, gp, cust_svc)
+        count = await notify_interested_customers(context.bot, product, gp, cust_svc, currency_label(settings))
         await _safe_edit(
             q.message,
-            f"✅ نوتیف برای «{product.name}» به *{count}* مشتری ارسال شد.",
+            f"✅ نوتیف برای «{_md_escape(product.name)}» به *{count}* مشتری ارسال شد.",
             parse_mode="Markdown",
             reply_markup=back_to_dashboard_kb(),
         )
