@@ -20,7 +20,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from services.gold_service import GoldService
-from services.price_service import format_price_alert, format_gold_price_alert
+from services.price_service import format_price_alert, format_gold_price_alert, currency_label
 from services.sheet_service import SheetService
 from utils.cache import Cache
 from utils.validators import is_admin
@@ -83,6 +83,13 @@ async def _route_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, data:
         await adm.cb_publish_list(update, context)
     elif action == "pub":
         await adm.cb_publish_preview(update, context, int(params[0]) if params else 0)
+    elif action == "pub_attr":
+        # a:pub_attr:<product_id>:<attr_key>
+        pid = int(params[0]) if len(params) > 0 else 0
+        akey = params[1] if len(params) > 1 else ""
+        await adm.cb_publish_attr_toggle(update, context, pid, akey)
+    elif action == "pub_go":
+        await adm.cb_publish_go(update, context, int(params[0]) if params else 0)
     elif action == "pubc":
         await adm.cb_publish_confirm(update, context, int(params[0]) if params else 0)
     elif action == "e_list":
@@ -181,8 +188,11 @@ async def _route_customer(update: Update, context: ContextTypes.DEFAULT_TYPE, da
     # ── 📈 Live gold price ────────────────────────────────────────────────────
     if action == "gp":
         try:
-            price    = await asyncio.to_thread(gold.get_gold_price)
-            last_upd = await asyncio.to_thread(gold.get_last_update)
+            price, last_upd, settings = await asyncio.gather(
+                asyncio.to_thread(gold.get_gold_price),
+                asyncio.to_thread(gold.get_last_update),
+                asyncio.to_thread(sheet.get_settings),
+            )
             if price == 0:
                 await query.answer(
                     "⚠️ قیمت طلا هنوز تنظیم نشده است.\nلطفاً با فروشگاه تماس بگیرید.",
@@ -190,7 +200,7 @@ async def _route_customer(update: Update, context: ContextTypes.DEFAULT_TYPE, da
                 )
             else:
                 await query.answer(
-                    format_gold_price_alert(price, last_upd),
+                    format_gold_price_alert(price, last_upd, currency_label(settings)),
                     show_alert=True,
                 )
         except Exception as exc:
@@ -205,14 +215,17 @@ async def _route_customer(update: Update, context: ContextTypes.DEFAULT_TYPE, da
             if product is None:
                 await query.answer(f"⚠️ محصول یافت نشد.", show_alert=True)
                 return
-            gold_price = await asyncio.to_thread(gold.get_gold_price)
+            gold_price, settings = await asyncio.gather(
+                asyncio.to_thread(gold.get_gold_price),
+                asyncio.to_thread(sheet.get_settings),
+            )
             if gold_price == 0:
                 await query.answer(
                     "⚠️ قیمت طلا هنوز تنظیم نشده است.\nلطفاً با فروشگاه تماس بگیرید.",
                     show_alert=True,
                 )
                 return
-            alert_text = format_price_alert(product, gold_price)
+            alert_text = format_price_alert(product, gold_price, currency_label(settings))
             await query.answer(alert_text, show_alert=True)
         except Exception as exc:
             logger.error("Customer product price callback error (pid=%s): %s", params, exc)
