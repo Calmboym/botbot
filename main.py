@@ -22,7 +22,12 @@ Run:
 import logging
 import sys
 
-from telegram import Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    Update,
+)
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -45,12 +50,54 @@ from providers import get_provider
 from services.ai_service import AIService
 from services.customer_service import CustomerService
 from services.gold_service import GoldService
+from services.price_service import currency_label
 from services.sheet_service import SheetService
 from services.summary_service import SummaryService
 from utils.cache import Cache
 from utils.logger import setup_logger
 
 logger = logging.getLogger(__name__)
+
+
+# ── Feature 3: "/" command hint menu ──────────────────────────────────────────
+
+async def _setup_commands(application: Application) -> None:
+    """
+    Populate Telegram's built-in "/" command suggestion menu.
+
+    Only commands that actually exist as real handlers are listed here.
+    This bot deliberately keeps product management inline-button-driven
+    from /admin (there is no separate /publish, /edit, /delete command —
+    see handlers/admin.py's dashboard), so the hint menu only ever offers
+    /start and /admin — never a fake command that does nothing if typed.
+
+    /admin is registered with a chat-scoped menu (BotCommandScopeChat) so
+    only the admin's own chat shows it; regular customers only ever see
+    /start in their hint menu.
+    """
+    default_commands = [
+        BotCommand("start", "شروع گفتگو با دستیار فروش"),
+    ]
+    admin_commands = [
+        BotCommand("start", "شروع گفتگو با دستیار فروش"),
+        BotCommand("admin", "باز کردن پنل مدیریت"),
+    ]
+
+    await application.bot.set_my_commands(default_commands, scope=BotCommandScopeDefault())
+
+    try:
+        await application.bot.set_my_commands(
+            admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID)
+        )
+    except Exception as exc:
+        # Telegram rejects a chat-scoped menu until that chat has messaged
+        # the bot at least once — harmless, the default menu still works.
+        logger.warning(
+            "Could not set admin-scoped command menu yet (admin may not "
+            "have started a chat with the bot): %s", exc,
+        )
+
+    logger.info("Command hint menu registered (/start for everyone, +/admin for admin).")
 
 
 # ── Scheduled job: automatic gold price update ────────────────────────────────
@@ -61,13 +108,20 @@ async def job_update_gold_price(context: ContextTypes.DEFAULT_TYPE) -> None:
     Scrapes tgju.org and writes the new price to the settings sheet.
     Notifies the admin on Telegram on success or failure.
     """
-    gold_service: GoldService = context.bot_data["gold_service"]
+    gold_service:  GoldService  = context.bot_data["gold_service"]
+    sheet_service: SheetService = context.bot_data["sheet_service"]
     logger.info("JobQueue: starting automatic gold price update …")
 
     try:
         old_price = gold_service.get_gold_price()
     except Exception:
         old_price = 0.0
+
+    try:
+        settings = sheet_service.get_settings()
+    except Exception:
+        settings = {}
+    currency = currency_label(settings)
 
     try:
         import asyncio as _asyncio
@@ -78,16 +132,16 @@ async def job_update_gold_price(context: ContextTypes.DEFAULT_TYPE) -> None:
             diff   = new_price - old_price
             pct    = (diff / old_price) * 100
             arrow  = "▲" if diff >= 0 else "▼"
-            change = f"\n{arrow} تغییر: {abs(diff):,.0f} تومان ({pct:+.2f}٪)"
+            change = f"\n{arrow} تغییر: {abs(diff):,.0f} {currency} ({pct:+.2f}٪)"
         else:
             change = ""
 
         msg = (
             f"🪙 *بروزرسانی خودکار قیمت طلا*\n\n"
-            f"💰 قیمت جدید: `{new_price:,.0f} تومان/گرم`"
+            f"💰 قیمت جدید: `{new_price:,.0f} {currency}/گرم`"
             f"{change}"
         )
-        logger.info("Auto price update: %.0f → %.0f Toman/gram", old_price, new_price)
+        logger.info("Auto price update: %.0f → %.0f %s/gram", old_price, new_price, currency)
 
     except Exception as exc:
         msg = (
@@ -149,7 +203,12 @@ def build_application() -> Application:
     summary_service  = SummaryService(ai_provider)
     customer_service = CustomerService()
 
-    application = Application.builder().token(TOKEN).build()
+    application = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(_setup_commands)   # Feature 3: register the "/" hint menu
+        .build()
+    )
 
     application.bot_data["sheet_service"]    = sheet_service
     application.bot_data["gold_service"]     = gold_service
