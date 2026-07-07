@@ -173,9 +173,9 @@ class Product:
             f"| {self.weight}گ | موجودی: {self.stock} | عکس: {photo_icon}"
         )
 
-    def admin_detail(self) -> str:
+    def admin_detail(self, currency: str = "تومان") -> str:
         e = _md_escape
-        po = f"\n💵 قیمت ثابت: `{self.price_override:,.0f} تومان`" if self.price_override else ""
+        po = f"\n💵 قیمت ثابت: `{self.price_override:,.0f} {currency}`" if self.price_override else ""
         photo_line = "✅ دارد" if self.has_photo else "❌ ندارد (عکس ارسال نشده)"
         return (
             f"*💍 {e(self.name)}*\n\n"
