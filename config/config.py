@@ -166,3 +166,29 @@ OPTION_FIELDS: dict[str, list[str]] = {
         "فیروزه", "سنگ طبیعی", "سنگ مصنوعی", "سایر"
     ],
 }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Publish-time attribute checklist (Feature 1)
+# ══════════════════════════════════════════════════════════════════════════════
+# Every key here is a toggleable line in the channel post caption. The admin
+# picks which ones to show EACH TIME they publish a product — the selection
+# lives only in the in-flight AdminState (utils/cache.py), never globally,
+# so publishing product A with {price, weight} does not affect product B.
+PUBLISH_ATTRIBUTES: dict[str, str] = {
+    "price":          "💰 قیمت",
+    "weight":         "⚖️ وزن",
+    "gold_color":     "🎨 رنگ طلا",
+    "purity":         "عیار",
+    "stone":          "💎 سنگ",
+    "wage_percent":   "🛠 اجرت",
+    "profit_percent": "📈 سود",
+    "stock":          "📦 موجودی",
+    "category":       "📂 دسته‌بندی",
+    "description":    "📝 توضیحات",
+}
+
+# Selected by default so a publish flow the admin doesn't customize looks
+# exactly like the previous, non-configurable caption (no breaking change).
+DEFAULT_PUBLISH_ATTRS: set[str] = {
+    "gold_color", "purity", "stone", "weight", "wage_percent", "profit_percent", "stock",
+}
