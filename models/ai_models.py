@@ -162,13 +162,13 @@ class CustomerProfile(BaseModel):
 
         return CustomerProfile.model_validate(data)
 
-    def summary_text(self) -> str:
+    def summary_text(self, currency: str = "تومان") -> str:
         """Human-readable (Persian) one-liner for embedding in AI prompts."""
         parts: list[str] = []
         if self.max_budget:
-            parts.append(f"بودجه تا {self.max_budget:,.0f} تومان")
+            parts.append(f"بودجه تا {self.max_budget:,.0f} {currency}")
         if self.min_budget:
-            parts.append(f"بودجه از {self.min_budget:,.0f} تومان")
+            parts.append(f"بودجه از {self.min_budget:,.0f} {currency}")
         if self.gender:
             parts.append(f"جنسیت: {self.gender}")
         if self.category:
