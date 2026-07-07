@@ -119,6 +119,10 @@ class AdminState:
     reply_user_id:  Optional[int] = None
     list_page:      int           = 0
     add_data:       dict          = field(default_factory=dict)
+    # Per-product attribute checklist for the publish flow (Feature 1).
+    # Scoped to `product_id` above — never global, reset whenever a new
+    # product enters the publish flow (see handlers/admin.cb_publish_attrs).
+    publish_attrs:  set           = field(default_factory=set)
     last_activity:  float         = field(default_factory=time.monotonic)
 
     def clear(self) -> None:
@@ -129,6 +133,7 @@ class AdminState:
         self.reply_user_id = None
         self.list_page = 0
         self.add_data = {}
+        self.publish_attrs = set()
         self.last_activity = time.monotonic()
 
 
