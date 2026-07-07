@@ -56,7 +56,7 @@ def validate_product_id(raw: str) -> tuple[bool, int, str]:
         return False, 0, "شناسه محصول باید عدد صحیح باشد."
 
 
-def validate_gold_price(raw: str) -> tuple[bool, float, str]:
+def validate_gold_price(raw: str, currency: str = "تومان") -> tuple[bool, float, str]:
     """Validate a manually entered gold price."""
     clean = raw.strip().replace(",", "").replace("٬", "")
     try:
@@ -66,7 +66,7 @@ def validate_gold_price(raw: str) -> tuple[bool, float, str]:
     if price <= 0:
         return False, 0.0, "قیمت باید بیشتر از صفر باشد."
     if price < 100_000:
-        return False, 0.0, "قیمت خیلی پایین به نظر می‌رسد. واحد: تومان."
+        return False, 0.0, f"قیمت خیلی پایین به نظر می‌رسد. واحد: {currency}."
     if price > 100_000_000:
         return False, 0.0, "قیمت خیلی بالا به نظر می‌رسد. لطفاً بررسی کنید."
     return True, price, ""
