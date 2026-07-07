@@ -104,6 +104,25 @@ def publish_confirm_kb(product_id: int) -> InlineKeyboardMarkup:
     ])
 
 
+def publish_attrs_kb(product_id: int, selected: set) -> InlineKeyboardMarkup:
+    """
+    Feature 1 — per-product attribute checklist shown before publishing.
+    Each row toggles one attribute on/off for THIS product only; the
+    selection lives in AdminState.publish_attrs, never applied globally.
+    """
+    from config.config import PUBLISH_ATTRIBUTES
+    rows = []
+    for key, label in PUBLISH_ATTRIBUTES.items():
+        mark = "✅" if key in selected else "⬜"
+        rows.append([InlineKeyboardButton(
+            f"{mark} {label}",
+            callback_data=f"a:pub_attr:{product_id}:{key}",
+        )])
+    rows.append([InlineKeyboardButton("▶️ ادامه به پیش‌نمایش", callback_data=f"a:pub_go:{product_id}")])
+    rows.append([InlineKeyboardButton("🔙 برگشت", callback_data="a:pub_list")])
+    return InlineKeyboardMarkup(rows)
+
+
 # ── Edit field groups ─────────────────────────────────────────────────────────
 
 def edit_groups_kb(product_id: int) -> InlineKeyboardMarkup:
@@ -223,12 +242,13 @@ def gold_price_kb() -> InlineKeyboardMarkup:
 # ── Settings ──────────────────────────────────────────────────────────────────
 
 def settings_kb(settings: dict) -> InlineKeyboardMarkup:
-    editable = ["store_name", "store_phone", "store_address", "currency"]
+    editable = ["store_name", "store_phone", "store_address", "currency", "post_footer"]
     labels   = {
         "store_name":    "🏪 نام فروشگاه",
         "store_phone":   "📞 تلفن",
         "store_address": "📍 آدرس",
         "currency":      "💱 واحد پول",
+        "post_footer":   "📝 متن پایانی پست‌ها",
     }
     rows = [
         [InlineKeyboardButton(
