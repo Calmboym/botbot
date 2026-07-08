@@ -43,7 +43,10 @@ from config.config import (
     PRICE_UPDATE_INTERVAL,
     WEBHOOK_URL, PORT, WEBHOOK_SECRET,
 )
-from handlers.admin import cmd_admin, handle_admin_message, handle_admin_photo
+from handlers.admin import (
+    cmd_admin, handle_admin_message, handle_admin_photo,
+    cmd_publish, cmd_preview, cmd_edit, cmd_delete,
+)
 from handlers.callbacks import callback_router
 from handlers.customer import cmd_start, handle_customer_text, handle_customer_photo
 from providers import get_provider
@@ -65,22 +68,30 @@ async def _setup_commands(application: Application) -> None:
     """
     Populate Telegram's built-in "/" command suggestion menu.
 
-    Only commands that actually exist as real handlers are listed here.
-    This bot deliberately keeps product management inline-button-driven
-    from /admin (there is no separate /publish, /edit, /delete command —
-    see handlers/admin.py's dashboard), so the hint menu only ever offers
-    /start and /admin — never a fake command that does nothing if typed.
+    Product management stays primarily inline-button-driven from /admin
+    (see handlers/admin.py's dashboard) — but Feature 5 adds direct
+    /publish|/preview|/edit|/delete <id> shortcuts for large catalogs, so
+    those are listed here too.
 
-    /admin is registered with a chat-scoped menu (BotCommandScopeChat) so
-    only the admin's own chat shows it; regular customers only ever see
-    /start in their hint menu.
+    Note: Telegram's BotCommand only supports ONE description per command
+    name, so each entry below documents both the no-argument (list) and
+    the <id> (direct) form in a single line rather than two separate menu
+    rows — Telegram's API has no concept of command "overloads".
+
+    /admin and the product commands are registered with a chat-scoped menu
+    (BotCommandScopeChat) so only the admin's own chat shows them; regular
+    customers only ever see /start in their hint menu.
     """
     default_commands = [
         BotCommand("start", "شروع گفتگو با دستیار فروش"),
     ]
     admin_commands = [
-        BotCommand("start", "شروع گفتگو با دستیار فروش"),
-        BotCommand("admin", "باز کردن پنل مدیریت"),
+        BotCommand("start",   "شروع گفتگو با دستیار فروش"),
+        BotCommand("admin",   "باز کردن پنل مدیریت"),
+        BotCommand("publish", "انتشار محصول — لیست، یا مستقیم با شناسه: /publish 15"),
+        BotCommand("preview", "پیش‌نمایش پست محصول با شناسه: /preview 15"),
+        BotCommand("edit",    "ویرایش محصول — لیست، یا مستقیم با شناسه: /edit 15"),
+        BotCommand("delete",  "حذف محصول — لیست، یا مستقیم با شناسه: /delete 15"),
     ]
 
     await application.bot.set_my_commands(default_commands, scope=BotCommandScopeDefault())
@@ -220,6 +231,11 @@ def build_application() -> Application:
     # Handlers
     application.add_handler(CommandHandler("start",   cmd_start))
     application.add_handler(CommandHandler("admin",   cmd_admin))
+    # Feature 5 — direct product commands by ID (large-catalog shortcut)
+    application.add_handler(CommandHandler("publish", cmd_publish))
+    application.add_handler(CommandHandler("preview", cmd_preview))
+    application.add_handler(CommandHandler("edit",    cmd_edit))
+    application.add_handler(CommandHandler("delete",  cmd_delete))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, route_text))
     application.add_handler(MessageHandler(filters.PHOTO, route_photo))
     application.add_handler(CallbackQueryHandler(callback_router))
