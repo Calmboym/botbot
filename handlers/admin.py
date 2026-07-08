@@ -62,6 +62,35 @@ async def _safe_edit(msg: Message, text: str, **kwargs) -> None:
         await msg.reply_text(text, **kwargs)
 
 
+def _target_message(update: Update) -> Message:
+    """
+    Feature 5 — return the Message to render output into, regardless of
+    whether this call came from an inline button (callback_query.message,
+    which _safe_edit will try to edit) or a direct slash command like
+    /publish 15 (update.message, which _safe_edit's fallback will reply to).
+
+    This lets every existing cb_xxx handler below serve BOTH entry points
+    with zero duplicated logic — the only difference is which Message
+    object gets passed in.
+    """
+    if update.callback_query:
+        return update.callback_query.message
+    return update.message
+
+
+async def _report_not_found(update: Update, msg: Message, product_id: int) -> None:
+    """
+    Feature 5 — report a missing product ID gracefully, never crashing.
+    Shows a popup alert when triggered by a button, or a plain reply when
+    triggered by a direct /publish|/preview|/edit|/delete <id> command.
+    """
+    text = f"❌ محصولی با شناسه {product_id} یافت نشد."
+    if update.callback_query:
+        await update.callback_query.answer(text, show_alert=True)
+    else:
+        await msg.reply_text(text)
+
+
 # ── /admin command ─────────────────────────────────────────────────────────────
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -71,10 +100,204 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sheet, gold, cache = _services(context)
     cache.clear_admin_state()
     await update.message.reply_text(
-        "🎛 *پنل مدیریت Gold Bot*\n\nیکی از گزینه‌ها را انتخاب کنید:",
+        "🎛 *پنل مدیریت Gold Bot*\n\n"
+        "یکی از گزینه‌ها را انتخاب کنید:\n\n"
+        "💡 _میان‌بر برای کاتالوگ بزرگ:_\n"
+        "`/publish <شناسه>` `/preview <شناسه>` `/edit <شناسه>` `/delete <شناسه>`",
         parse_mode="Markdown",
         reply_markup=dashboard_kb(),
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Feature 5 — Direct product commands by ID
+# ══════════════════════════════════════════════════════════════════════════════
+# /publish <id>, /preview <id>, /edit <id>, /delete <id> let the admin skip
+# the product list entirely for large catalogs. Each command, when given an
+# ID, delegates straight to the SAME cb_xxx handler a button click on that
+# product would trigger (see _target_message() above) — there is no second
+# implementation of publishing/previewing/editing/deleting anywhere.
+#
+# Product lookup always goes through SheetService.get_product_by_id() — the
+# single existing lookup function already used everywhere else in this file.
+#
+# With no ID argument, every command falls back to the original, unchanged
+# list-based workflow (cb_publish_list / cb_edit_list / cb_delete_list).
+
+def _parse_product_id_arg(context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    """
+    Parse a single numeric product ID from context.args (Feature 5).
+
+    Returns:
+        None if no argument was given at all (caller should fall back to
+        the existing list-based workflow).
+
+    Raises:
+        ValueError: An argument WAS given but isn't a valid non-negative
+                    integer — caller shows a friendly message instead of
+                    letting int() raise an uncaught exception.
+    """
+    if not context.args:
+        return None
+    raw = context.args[0].strip()
+    if not raw.isdigit():
+        raise ValueError(raw)
+    return int(raw)
+
+
+async def publish_product_by_id(update: Update, context: ContextTypes.DEFAULT_TYPE, product_id: int) -> None:
+    """
+    Feature 5 reusable entry point — opens product `product_id` directly at
+    the same first step a button click on it (from the publish list) would:
+    the per-product attribute checklist (cb_publish_preview). No separate
+    publishing implementation.
+    """
+    sheet, _, _ = _services(context)
+    product = await asyncio.to_thread(sheet.get_product_by_id, product_id)
+    if not product:
+        await _report_not_found(update, _target_message(update), product_id)
+        return
+    await cb_publish_preview(update, context, product_id)
+
+
+async def preview_product_by_id(update: Update, context: ContextTypes.DEFAULT_TYPE, product_id: int) -> None:
+    """
+    Feature 5 reusable entry point — renders the exact channel-post caption
+    for `product_id` (currency, footer, and any in-progress attribute
+    selection already applied) WITHOUT publishing it, by reusing
+    cb_publish_go() — the identical function the button-driven "step 2"
+    preview uses. Guarantees /preview <id> always matches what /publish <id>
+    would eventually send; no separate rendering logic.
+    """
+    sheet, _, _ = _services(context)
+    product = await asyncio.to_thread(sheet.get_product_by_id, product_id)
+    if not product:
+        await _report_not_found(update, _target_message(update), product_id)
+        return
+    await cb_publish_go(update, context, product_id)
+
+
+async def edit_product_by_id(update: Update, context: ContextTypes.DEFAULT_TYPE, product_id: int) -> None:
+    """Feature 5 reusable entry point — opens the field-group editor directly."""
+    sheet, _, cache = _services(context)
+    product = await asyncio.to_thread(sheet.get_product_by_id, product_id)
+    if not product:
+        await _report_not_found(update, _target_message(update), product_id)
+        return
+    state = cache.get_admin_state()
+    state.action = "edit"
+    cache.save_admin_state(state)
+    await cb_edit_groups(update, context, product_id)
+
+
+async def delete_product_by_id(update: Update, context: ContextTypes.DEFAULT_TYPE, product_id: int) -> None:
+    """Feature 5 reusable entry point — jumps straight to the delete confirmation."""
+    sheet, _, cache = _services(context)
+    product = await asyncio.to_thread(sheet.get_product_by_id, product_id)
+    if not product:
+        await _report_not_found(update, _target_message(update), product_id)
+        return
+    state = cache.get_admin_state()
+    state.action = "delete"
+    cache.save_admin_state(state)
+    await cb_delete_confirm_prompt(update, context, product_id)
+
+
+async def cmd_publish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /publish            → existing product-list workflow (unchanged)
+    /publish <id>       → jump straight into publishing that product,
+                           skipping the list entirely (Feature 5)
+    """
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ دسترسی مجاز نیست.")
+        return
+    try:
+        product_id = _parse_product_id_arg(context)
+    except ValueError as bad_value:
+        await update.message.reply_text(
+            f"⚠️ شناسه محصول باید یک عدد باشد. دریافت شد: «{bad_value}»\n\n"
+            "مثال: `/publish 15`",
+            parse_mode="Markdown",
+        )
+        return
+
+    if product_id is None:
+        await cb_publish_list(update, context)
+        return
+    await publish_product_by_id(update, context, product_id)
+
+
+async def cmd_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/preview <id> — show the exact post that would be published, without publishing it (Feature 5)."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ دسترسی مجاز نیست.")
+        return
+    try:
+        product_id = _parse_product_id_arg(context)
+    except ValueError as bad_value:
+        await update.message.reply_text(
+            f"⚠️ شناسه محصول باید یک عدد باشد. دریافت شد: «{bad_value}»\n\n"
+            "مثال: `/preview 15`",
+            parse_mode="Markdown",
+        )
+        return
+
+    if product_id is None:
+        await update.message.reply_text(
+            "📌 لطفاً شناسه محصول را وارد کنید.\n\nمثال: `/preview 15`",
+            parse_mode="Markdown",
+        )
+        return
+    await preview_product_by_id(update, context, product_id)
+
+
+async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /edit            → existing product-list workflow (unchanged)
+    /edit <id>       → open the field-group editor directly (Feature 5)
+    """
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ دسترسی مجاز نیست.")
+        return
+    try:
+        product_id = _parse_product_id_arg(context)
+    except ValueError as bad_value:
+        await update.message.reply_text(
+            f"⚠️ شناسه محصول باید یک عدد باشد. دریافت شد: «{bad_value}»\n\n"
+            "مثال: `/edit 15`",
+            parse_mode="Markdown",
+        )
+        return
+
+    if product_id is None:
+        await cb_edit_list(update, context)
+        return
+    await edit_product_by_id(update, context, product_id)
+
+
+async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /delete            → existing product-list workflow (unchanged)
+    /delete <id>       → jump straight to the delete confirmation (Feature 5)
+    """
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ دسترسی مجاز نیست.")
+        return
+    try:
+        product_id = _parse_product_id_arg(context)
+    except ValueError as bad_value:
+        await update.message.reply_text(
+            f"⚠️ شناسه محصول باید یک عدد باشد. دریافت شد: «{bad_value}»\n\n"
+            "مثال: `/delete 15`",
+            parse_mode="Markdown",
+        )
+        return
+
+    if product_id is None:
+        await cb_delete_list(update, context)
+        return
+    await delete_product_by_id(update, context, product_id)
 
 
 # ── Text message router (during active admin flow) ────────────────────────────
@@ -236,14 +459,14 @@ async def cb_publish_list(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     state = cache.get_admin_state()
     state.action = "publish"
     cache.save_admin_state(state)
-    q = update.callback_query
+    msg = _target_message(update)
     products = await asyncio.to_thread(sheet.get_products)
     available = [p for p in products if p.status == "active"]
     if not available:
-        await _safe_edit(q.message, "⚠️ هیچ محصول فعالی برای انتشار وجود ندارد.", reply_markup=back_to_dashboard_kb())
+        await _safe_edit(msg, "⚠️ هیچ محصول فعالی برای انتشار وجود ندارد.", reply_markup=back_to_dashboard_kb())
         return
     await _safe_edit(
-        q.message,
+        msg,
         "📢 *انتشار محصول*\n\nمحصولی که می‌خواهید منتشر کنید را انتخاب کنید:",
         parse_mode="Markdown",
         reply_markup=products_list_kb(available, 0, action_prefix="a:pub", back_cb="a:d"),
@@ -256,15 +479,14 @@ async def cb_publish_preview(update: Update, context: ContextTypes.DEFAULT_TYPE,
     appear under THIS product's post (per-product, never global).
 
     Note: this function is triggered by the `a:pub:<id>` callback (product
-    selected from the publish list) and now shows the attribute checklist
-    instead of jumping straight to the preview — the old single-step flow
-    became a two-step flow: checklist → preview → confirm.
+    selected from the publish list) AND by /publish <id> (Feature 5) — the
+    old single-step flow became a two-step flow: checklist → preview → confirm.
     """
     sheet, _, cache = _services(context)
-    q = update.callback_query
+    msg = _target_message(update)
     product = await asyncio.to_thread(sheet.get_product_by_id, product_id)
     if not product:
-        await q.answer("⚠️ محصول یافت نشد.", show_alert=True)
+        await _report_not_found(update, msg, product_id)
         return
 
     from config.config import DEFAULT_PUBLISH_ATTRS
@@ -276,7 +498,7 @@ async def cb_publish_preview(update: Update, context: ContextTypes.DEFAULT_TYPE,
     cache.save_admin_state(state)
 
     await _safe_edit(
-        q.message,
+        msg,
         f"📢 *انتخاب اطلاعات نمایشی برای «{_md_escape(product.name)}»*\n\n"
         "کدام مشخصات زیر پست این محصول نشان داده شود؟\n"
         "_(این انتخاب فقط برای همین محصول است)_",
@@ -325,12 +547,16 @@ async def cb_publish_go(update: Update, context: ContextTypes.DEFAULT_TYPE, prod
     Step 2 of publishing — show the EXACT caption that will be posted
     (selected attributes + resolved currency + global footer already
     applied), then ask for final confirmation.
+
+    Also reused directly by /preview <id> (Feature 5) via
+    preview_product_by_id(), so the command and the button flow are
+    guaranteed to render an identical preview — single implementation.
     """
     sheet, gold, cache = _services(context)
-    q = update.callback_query
+    msg = _target_message(update)
     product = await asyncio.to_thread(sheet.get_product_by_id, product_id)
     if not product:
-        await q.answer("⚠️ محصول یافت نشد.", show_alert=True)
+        await _report_not_found(update, msg, product_id)
         return
 
     state = cache.get_admin_state()
@@ -352,7 +578,7 @@ async def cb_publish_go(update: Update, context: ContextTypes.DEFAULT_TYPE, prod
         f"──────────\n"
         f"⚠️ آیا این محصول را در کانال منتشر می‌کنید؟"
     )
-    await _safe_edit(q.message, text, parse_mode="Markdown", reply_markup=publish_confirm_kb(product_id))
+    await _safe_edit(msg, text, parse_mode="Markdown", reply_markup=publish_confirm_kb(product_id))
 
 
 async def cb_publish_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, product_id: int) -> None:
@@ -389,13 +615,13 @@ async def cb_edit_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     state = cache.get_admin_state()
     state.action = "edit"
     cache.save_admin_state(state)
-    q = update.callback_query
+    msg = _target_message(update)
     products = await asyncio.to_thread(sheet.get_products)
     if not products:
-        await _safe_edit(q.message, "📦 محصولی یافت نشد.", reply_markup=back_to_dashboard_kb())
+        await _safe_edit(msg, "📦 محصولی یافت نشد.", reply_markup=back_to_dashboard_kb())
         return
     await _safe_edit(
-        q.message,
+        msg,
         "✏️ *ویرایش محصول*\n\nمحصول مورد نظر را انتخاب کنید:",
         parse_mode="Markdown",
         reply_markup=products_list_kb(products, 0, action_prefix="a:e", back_cb="a:d"),
@@ -403,18 +629,19 @@ async def cb_edit_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cb_edit_groups(update: Update, context: ContextTypes.DEFAULT_TYPE, product_id: int) -> None:
-    q = update.callback_query
+    """Also reused directly by /edit <id> (Feature 5) via edit_product_by_id()."""
     sheet, _, cache = _services(context)
+    msg = _target_message(update)
     product = await asyncio.to_thread(sheet.get_product_by_id, product_id)
     if not product:
-        await q.answer("⚠️ محصول یافت نشد.", show_alert=True)
+        await _report_not_found(update, msg, product_id)
         return
     state = cache.get_admin_state()
     state.product_id = product_id
     cache.save_admin_state(state)
     await _safe_edit(
-        q.message,
-        f"✏️ *ویرایش: {product.name}*\n\nگروه فیلد مورد نظر را انتخاب کنید:",
+        msg,
+        f"✏️ *ویرایش: {_md_escape(product.name)}*\n\nگروه فیلد مورد نظر را انتخاب کنید:",
         parse_mode="Markdown",
         reply_markup=edit_groups_kb(product_id),
     )
@@ -516,13 +743,13 @@ async def cb_delete_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     state = cache.get_admin_state()
     state.action = "delete"
     cache.save_admin_state(state)
-    q = update.callback_query
+    msg = _target_message(update)
     products = await asyncio.to_thread(sheet.get_products)
     if not products:
-        await _safe_edit(q.message, "📦 محصولی یافت نشد.", reply_markup=back_to_dashboard_kb())
+        await _safe_edit(msg, "📦 محصولی یافت نشد.", reply_markup=back_to_dashboard_kb())
         return
     await _safe_edit(
-        q.message,
+        msg,
         "❌ *حذف محصول*\n\nمحصول مورد نظر را انتخاب کنید:",
         parse_mode="Markdown",
         reply_markup=products_list_kb(products, 0, action_prefix="a:del", back_cb="a:d"),
@@ -530,12 +757,16 @@ async def cb_delete_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def cb_delete_confirm_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, product_id: int) -> None:
+    """Also reused directly by /delete <id> (Feature 5) via delete_product_by_id()."""
     sheet, _, _ = _services(context)
-    q = update.callback_query
+    msg = _target_message(update)
     product = await asyncio.to_thread(sheet.get_product_by_id, product_id)
-    name = product.name if product else f"#{product_id}"
+    if not product:
+        await _report_not_found(update, msg, product_id)
+        return
+    name = _md_escape(product.name)
     await _safe_edit(
-        q.message,
+        msg,
         f"⚠️ آیا مطمئنید می‌خواهید محصول «{name}» را حذف کنید؟\nاین عملیات قابل بازگشت نیست.",
         reply_markup=delete_confirm_kb(product_id),
     )
