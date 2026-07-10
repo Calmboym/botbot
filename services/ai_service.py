@@ -146,7 +146,7 @@ class AIService:
         system_prompt = self._build_system_prompt(settings, profile, summary)
         context = (
             f"[محصول مورد نظر مشتری]\n{product.admin_detail(currency=currency)}\n"
-            f"قیمت تقریبی: {price:,.0f} {currency}\n"
+            f"قیمت نهایی این محصول: {price:,.0f} {currency}\n"
             f"شناسه این محصول برای image_product_ids: {product.id}\n\n"
             f"---\nپیام مشتری: {user_question}"
         )
