@@ -83,8 +83,8 @@ GROQ_VISION_MODEL: str = os.environ.get(
 
 # ── Gemini (skeleton — see providers/gemini_provider.py) ──────────────────────
 GEMINI_API_KEY: str      = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL: str        = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
-GEMINI_VISION_MODEL: str = os.environ.get("GEMINI_VISION_MODEL", "gemini-2.5-flash").strip()
+GEMINI_MODEL: str        = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro").strip()
+GEMINI_VISION_MODEL: str = os.environ.get("GEMINI_VISION_MODEL", "gemini-2.5-pro").strip()
 
 # ── OpenAI (skeleton — see providers/openai_provider.py) ──────────────────────
 OPENAI_API_KEY: str      = os.environ.get("OPENAI_API_KEY", "").strip()
