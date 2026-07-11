@@ -23,7 +23,7 @@ python-dotenv>=1.0.0
 
 # Groq AI (default provider — fast inference, OpenAI-compatible API)
 groq>=0.9.0
-google-genai
+google-genai>=0.3.0
 
 # Structured data models for the AI layer (IntentExtraction, CustomerProfile, etc.)
 pydantic>=2.6.0
