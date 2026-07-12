@@ -63,12 +63,34 @@ class IntentExtraction(BaseModel):
     gender:         Optional[str]   = None
     gold_color:     Optional[str]   = None
     stone:          Optional[str]   = None
+
+    # Budget values are RAW — exactly the number the customer said, in
+    # whichever currency `budget_currency` names (NOT pre-converted by the
+    # AI). Actual Toman<->Rial normalization into the store's configured
+    # currency happens once, deterministically, in
+    # services.price_service.normalize_intent_budget() — never trust an
+    # LLM to reliably do the ×10/÷10 arithmetic itself.
     max_budget:     Optional[float] = None
     min_budget:     Optional[float] = None
     max_weight:     Optional[float] = None
     min_weight:     Optional[float] = None
     style_keywords: list[str]       = Field(default_factory=list)
     occasion:       Optional[str]   = None
+
+    # Currency awareness (Part 1/2) — canonical codes only: "IRT" (Toman)
+    # or "IRR" (Rial). None means the customer did NOT explicitly name a
+    # currency for their budget; callers must then assume the store's
+    # configured currency (never guess a specific one).
+    budget_currency:     Optional[str] = None
+    # Set only when the customer explicitly asked to see PRICES in a
+    # different currency than the store default for this reply
+    # (e.g. "به تومان بگو") — a per-turn display override, not persisted.
+    price_currency:       Optional[str] = None
+    # Confidence (0..1) in the extracted budget_currency. Should be 1.0
+    # whenever the customer used an explicit currency word; lower only if
+    # inferred indirectly. budget_currency should simply be left null
+    # rather than set with low confidence when genuinely ambiguous.
+    currency_confidence: float = Field(1.0, ge=0.0, le=1.0)
 
     # Only set when the model is confident — None means "no signal this turn"
     # so profile merging never overwrites a known stage/urgency/emotion with
@@ -89,6 +111,15 @@ class IntentExtraction(BaseModel):
         except (TypeError, ValueError):
             return 0
         return max(0, min(100, v))
+
+    @field_validator("currency_confidence", mode="before")
+    @classmethod
+    def _clamp_0_1(cls, v):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return 1.0
+        return max(0.0, min(1.0, v))
 
 
 # ── Cumulative per-user profile ───────────────────────────────────────────────
@@ -224,11 +255,22 @@ class ProductContext(BaseModel):
     stock:           int   = 0
     relevance_score: float = 0.0
 
-    def as_ai_line(self) -> str:
+    def as_ai_line(self, currency: str = "") -> str:
+        """
+        Render this product as one context line for the AI prompt.
+
+        Args:
+            currency: Resolved store currency label (see
+                      services.price_service.currency_label). Must be
+                      passed explicitly by the caller — this method never
+                      assumes a currency, so the AI is never shown a price
+                      with the wrong (or a hardcoded) unit attached.
+        """
+        price_part = f"{self.price:,.0f} {currency}".strip() if currency else f"{self.price:,.0f}"
         return (
             f"ID:{self.id} | {self.name} | دسته:{self.category} | جنسیت:{self.gender} | "
             f"رنگ:{self.gold_color} | سنگ:{self.stone or 'ندارد'} | وزن:{self.weight}گ | "
-            f"قیمت:{self.price:,.0f}ت | موجودی:{self.stock}"
+            f"قیمت:{price_part} | موجودی:{self.stock}"
         )
 
 
