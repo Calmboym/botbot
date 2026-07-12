@@ -30,7 +30,7 @@ from keyboards.customer_keyboard import build_notify_keyboard, build_support_key
 from services.ai_service import AIService
 from services.customer_service import CustomerService
 from services.gold_service import GoldService
-from services.price_service import calculate_price
+from services.price_service import calculate_price, currency_label, normalize_intent_budget
 from services.publish_service import send_product_photo
 from services.search_service import build_query, search
 from services.sheet_service import SheetService
@@ -243,7 +243,8 @@ async def _process_ai_message(
                 return
 
             await _apply_ai_response(update, context, cache, conv_state, user_message, ai_response, sheet, chat_id)
-            conv_state.profile = conv_state.profile.merge_intent(ai_response.intent)
+            normalized_intent = normalize_intent_budget(ai_response.intent, settings)
+            conv_state.profile = conv_state.profile.merge_intent(normalized_intent)
             cache.save_conversation(conv_state)
             await _persist_profile(cust_svc, conv_state)
 
@@ -252,9 +253,9 @@ async def _process_ai_message(
             return
 
     # ── Normal AI chat flow ────────────────────────────────────────────────────
-    query = build_query(conv_state.profile, user_message)
+    query = build_query(conv_state.profile, user_message, settings)
     search_result = search(products, query, gold_price, conv_state.profile)
-    product_lines = [p.as_ai_line() for p in search_result.products]
+    product_lines = [p.as_ai_line(currency=currency_label(settings)) for p in search_result.products]
 
     logger.info(
         "User %d | '%s' | %d products in context",
@@ -282,7 +283,10 @@ async def _process_ai_message(
     await _apply_ai_response(update, context, cache, conv_state, user_message, ai_response, sheet, chat_id)
 
     # ── Merge this turn's extracted intent into the cumulative profile ────────
-    conv_state.profile = conv_state.profile.merge_intent(ai_response.intent)
+    # Budget values are normalized into store currency HERE — the single
+    # choke point — before ever touching CustomerProfile/search comparisons.
+    normalized_intent = normalize_intent_budget(ai_response.intent, settings)
+    conv_state.profile = conv_state.profile.merge_intent(normalized_intent)
 
     # ── Defensive local fallback: customer clearly asked for a photo but ─────
     # the AI didn't include an image_product_ids entry.
