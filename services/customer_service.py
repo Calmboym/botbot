@@ -51,12 +51,88 @@ class CustomerService:
         client = gspread.Client(auth=creds)
         ss = client.open(SPREADSHEET_NAME)
         try:
-            return ss.worksheet(CUSTOMERS_SHEET)
+            ws = ss.worksheet(CUSTOMERS_SHEET)
         except gspread.exceptions.WorksheetNotFound:
             ws = ss.add_worksheet(title=CUSTOMERS_SHEET, rows=1000, cols=len(_HEADERS))
             ws.append_row(_HEADERS)
             logger.info("Created '%s' worksheet.", CUSTOMERS_SHEET)
             return ws
+
+        self._ensure_valid_headers(ws)
+        return ws
+
+    def _ensure_valid_headers(self, ws: gspread.Worksheet) -> None:
+        """
+        Part 3 fix — validate and, if necessary, repair the header row
+        BEFORE anything ever calls get_all_records() on this worksheet.
+
+        gspread's get_all_records() raises
+        "The header row in the worksheet contains duplicates: ['']"
+        whenever the header row has ANY empty cell or repeated name — a
+        single trailing empty column is enough to trigger this, since two
+        empty strings ('' == '') count as duplicates. This is the exact
+        root cause of the reported crash when saving an existing customer:
+        the lookup (_find_row) never even got a chance to run.
+
+        This repairs ONLY the header row (row 1), in place:
+          - empty header cells are renamed to a unique placeholder
+          - duplicate header names are suffixed to be unique
+          - any column our schema expects but that's missing is appended
+            at the end
+        Every data row is left completely untouched — satisfies "Do not
+        delete customer data. Do not recreate the whole sheet. Preserve
+        existing rows. Repair only structure problems."
+        """
+        try:
+            raw_headers = ws.row_values(1)
+        except Exception as exc:
+            logger.error("Could not read header row for '%s': %s", CUSTOMERS_SHEET, exc)
+            return
+
+        if not raw_headers:
+            # Existing tab with no header row at all yet (e.g. manually created empty sheet).
+            ws.update(range_name="A1", values=[_HEADERS])
+            logger.warning(
+                "Header repair: '%s' had no header row — wrote the expected schema fresh.",
+                CUSTOMERS_SHEET,
+            )
+            return
+
+        seen: dict[str, int] = {}
+        repaired: list[str] = []
+        changed = False
+
+        for idx, name in enumerate(raw_headers):
+            clean = str(name or "").strip()
+            if not clean:
+                clean = f"_empty_col_{idx + 1}"
+                changed = True
+            if clean in seen:
+                seen[clean] += 1
+                clean = f"{clean}_{seen[clean]}"
+                changed = True
+            else:
+                seen[clean] = 0
+            repaired.append(clean)
+
+        # Ensure every column our schema needs actually exists — append any
+        # MISSING expected columns at the end. Never removes, renames, or
+        # reorders anything already there, so existing data columns are
+        # never misaligned.
+        missing = [h for h in _HEADERS if h not in repaired]
+        if missing:
+            repaired = repaired + missing
+            changed = True
+
+        if changed:
+            ws.update(range_name="A1", values=[repaired])
+            logger.warning(
+                "Header repair: normalized headers in '%s' — raw=%r -> repaired=%r "
+                "(data rows untouched, missing expected columns=%s).",
+                CUSTOMERS_SHEET, raw_headers, repaired, missing or "none",
+            )
+        else:
+            logger.debug("Header check: '%s' headers already valid.", CUSTOMERS_SHEET)
 
     def _find_row(self, ws: gspread.Worksheet, user_id: int) -> tuple[int, Optional[dict]]:
         records = ws.get_all_records(numericise_ignore=["all"])
@@ -157,7 +233,7 @@ class CustomerService:
 
             if existing:
                 ws.update(range_name=f"A{row_idx}", values=[row])
-                logger.debug("Updated customer profile for user %d.", profile.user_id)
+                logger.info("Updated existing customer profile for user %d (row %d).", profile.user_id, row_idx)
             else:
                 ws.append_row(row)
                 logger.info("Inserted new customer profile for user %d.", profile.user_id)
