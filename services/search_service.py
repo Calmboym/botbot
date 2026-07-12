@@ -83,8 +83,30 @@ _OCCASION_MAP: dict[str, list[str]] = {
     "روزمره": ["روزانه", "روزمره", "هر روز", "کاری"],
 }
 
+# Explicit Toman/Rial mentions in the customer's own words (Part 1 of the
+# currency fix). Only an EXPLICIT match sets a currency — if none of these
+# appear, the caller must assume store currency, never guess.
+_CURRENCY_WORD_MAP: dict[str, str] = {
+    "تومان": "IRT", "تومن": "IRT", "toman": "IRT",
+    "ریال":  "IRR", "rial":  "IRR",
+}
 
-def _extract_budget(t: str) -> tuple[Optional[float], Optional[float]]:
+
+def _detect_currency_word(t: str) -> Optional[str]:
+    """Detect an explicit Toman/Rial mention anywhere in the message (local, no AI call)."""
+    for word, code in _CURRENCY_WORD_MAP.items():
+        if word in t:
+            return code
+    return None
+
+
+def _extract_budget(t: str) -> tuple[Optional[float], Optional[float], Optional[str]]:
+    """
+    Extract a raw budget figure (exactly as typed, in millions/units — NOT
+    yet currency-normalized) plus the currency the customer explicitly
+    named, if any. Currency normalization into store currency happens
+    separately in local_extract() via price_service.normalize_amount().
+    """
     max_b = min_b = None
     under = re.search(r"(?:زیر|تا|کمتر از)\s*([\d,]+(?:\.\d+)?)\s*میلیون", t)
     over  = re.search(r"(?:بالای|بیشتر از)\s*([\d,]+(?:\.\d+)?)\s*میلیون", t)
@@ -103,7 +125,9 @@ def _extract_budget(t: str) -> tuple[Optional[float], Optional[float]]:
             max_b = float(toman.group(1).replace(",", ""))
         except ValueError:
             pass
-    return max_b, min_b
+
+    currency_code = _detect_currency_word(t)
+    return max_b, min_b, currency_code
 
 
 def _extract_weight(t: str) -> tuple[Optional[float], Optional[float]]:
@@ -117,18 +141,31 @@ def _extract_weight(t: str) -> tuple[Optional[float], Optional[float]]:
     return max_w, min_w
 
 
-def local_extract(text: str) -> SearchQuery:
+def local_extract(text: str, settings: Optional[dict] = None) -> SearchQuery:
     """
     Cheap, deterministic, NO-AI-CALL extraction from a single message.
     Used only to seed the same-turn product search before the AI runs.
+
+    Args:
+        settings: Store settings dict (needs 'currency'). Any budget the
+                  customer names in Toman or Rial is normalized into the
+                  store's configured currency here — see
+                  services.price_service.normalize_amount(). If omitted,
+                  the store currency defaults to Toman (matching
+                  price_service's own default fallback).
     """
     if not text:
         return SearchQuery()
 
+    from services.price_service import normalize_amount
+
+    settings = settings or {}
     t = text.lower()
     q = SearchQuery()
 
-    q.max_budget, q.min_budget = _extract_budget(t)
+    raw_max, raw_min, detected_currency = _extract_budget(t)
+    q.max_budget = normalize_amount(raw_max, detected_currency, settings, context="local:max_budget")
+    q.min_budget = normalize_amount(raw_min, detected_currency, settings, context="local:min_budget")
     q.max_weight, q.min_weight = _extract_weight(t)
 
     for gender, kws in _GENDER_MAP.items():
@@ -157,14 +194,18 @@ def local_extract(text: str) -> SearchQuery:
     return q
 
 
-def build_query(profile: CustomerProfile, current_text: str = "") -> SearchQuery:
+def build_query(profile: CustomerProfile, current_text: str = "", settings: Optional[dict] = None) -> SearchQuery:
     """
-    Combine (1) cheap local extraction from the CURRENT message with
-    (2) the customer's cumulative profile as a fallback for anything the
-    current message didn't mention. The current message always wins when
-    it explicitly says something.
+    Combine (1) cheap local extraction from the CURRENT message (with any
+    Toman/Rial budget normalized into store currency — see local_extract)
+    with (2) the customer's cumulative profile as a fallback for anything
+    the current message didn't mention. profile.max_budget/min_budget are
+    always already store-currency-normalized (see
+    CustomerProfile.merge_intent + price_service.normalize_intent_budget),
+    so no further conversion is needed on that side. The current message
+    always wins when it explicitly says something.
     """
-    local = local_extract(current_text)
+    local = local_extract(current_text, settings)
     return SearchQuery(
         category       = local.category or profile.category,
         gender         = local.gender or profile.gender,
