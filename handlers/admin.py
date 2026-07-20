@@ -690,12 +690,42 @@ async def cb_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE, fiel
     )
 
 
+async def _maybe_notify_back_in_stock(context: ContextTypes.DEFAULT_TYPE, product_id: int, field: str) -> None:
+    """
+    Task 4 — after a stock/status edit, if the product is now available,
+    automatically notify everyone on its back-in-stock waitlist and mark
+    them as notified. No-op for any other field, or if nobody is waiting.
+
+    update_product_field() already invalidated the products cache before
+    this runs, so the re-fetch below reflects this exact edit. Never
+    raises — a failure here must never break the admin's own
+    edit-confirmation message.
+    """
+    if field not in ("stock", "status"):
+        return
+    stock_svc = context.bot_data.get("stock_notification_service")
+    if stock_svc is None:
+        return
+    try:
+        sheet, _, _ = _services(context)
+        product = await asyncio.to_thread(sheet.get_product_by_id, product_id)
+        if not product or not product.is_available:
+            return
+        from services.stock_notification_service import notify_back_in_stock
+        count = await notify_back_in_stock(context.bot, product, stock_svc)
+        if count:
+            logger.info("Back-in-stock: notified %d waiting customer(s) for product %d.", count, product_id)
+    except Exception as exc:
+        logger.error("Back-in-stock notify check failed for product %d: %s", product_id, exc)
+
+
 async def cb_edit_field_option(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str, product_id: int, value: str) -> None:
     """Handle option selection for an edit field (e.g. status, gold_color)."""
     q = update.callback_query
     sheet, _, cache = _services(context)
     try:
         await asyncio.to_thread(sheet.update_product_field, product_id, field, value)
+        await _maybe_notify_back_in_stock(context, product_id, field)
         await q.answer("✅ بروزرسانی شد.", show_alert=False)
         await _safe_edit(q.message, f"✅ فیلد «{field}» به «{value}» تغییر یافت.", reply_markup=back_to_dashboard_kb())
     except Exception as exc:
@@ -726,6 +756,7 @@ async def _apply_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     try:
         await asyncio.to_thread(sheet.update_product_field, pid, field, value)
+        await _maybe_notify_back_in_stock(context, pid, field)
         cache.clear_admin_state()
         await update.message.reply_text(
             f"✅ فیلد «{FIELD_LABELS.get(field, field)}» محصول {pid} به «{value}» تغییر یافت.",
@@ -1146,17 +1177,20 @@ async def cb_customers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     try:
-        all_custs = await asyncio.to_thread(cust_svc.get_notify_profiles)
+        all_custs = await asyncio.to_thread(cust_svc.get_all_profiles)
         count = len(all_custs)
+        notify_count = sum(1 for c in all_custs if c.notify_enabled)
     except Exception as exc:
         logger.error("Customers load error: %s", exc)
         count = "؟"
+        notify_count = "؟"
 
     await _safe_edit(
         q.message,
         f"👥 *مدیریت مشتریان*\n\n"
-        f"🔔 مشتریان با نوتیف فعال: `{count}`\n\n"
-        "از این بخش می‌توانید لیست علاقه‌مندی‌های مشتریان را ببینید\n"
+        f"👤 کل مشتریان ثبت‌شده: `{count}`\n"
+        f"🔔 با نوتیف فعال: `{notify_count}`\n\n"
+        "از این بخش می‌توانید لیست کامل مشتریان را ببینید\n"
         "و وقتی محصول جدیدی موجود شد، نوتیف دستی بفرستید.",
         parse_mode="Markdown",
         reply_markup=customers_kb(),
@@ -1164,7 +1198,7 @@ async def cb_customers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cb_customers_list(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0) -> None:
-    """📋 لیست مشتریانی که نوتیف فعال دارند."""
+    """📋 لیست همه مشتریان ثبت‌شده در شیت (نه فقط نوتیف‌فعال‌ها — رفع باگ Task 1)."""
     q = update.callback_query
     cust_svc: "CustomerService" = context.bot_data.get("customer_service")
     if cust_svc is None:
@@ -1172,7 +1206,7 @@ async def cb_customers_list(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         return
 
     try:
-        custs = await asyncio.to_thread(cust_svc.get_notify_profiles)
+        custs = await asyncio.to_thread(cust_svc.get_all_profiles)
     except Exception as exc:
         logger.error("Failed to load customer list: %s", exc)
         await _safe_edit(q.message, f"❌ خطا: {exc}", reply_markup=back_to_dashboard_kb())
@@ -1181,8 +1215,8 @@ async def cb_customers_list(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if not custs:
         await _safe_edit(
             q.message,
-            "👥 هیچ مشتری‌ای نوتیف فعال ندارد.\n\n"
-            "مشتریان وقتی از ربات درخواست اطلاع‌رسانی کنند، اینجا نمایش داده می‌شوند.",
+            "👥 هنوز هیچ مشتری‌ای در شیت ثبت نشده.\n\n"
+            "به محض اولین گفتگوی یک مشتری با ربات، اینجا نمایش داده می‌شود.",
             reply_markup=back_to_dashboard_kb(),
         )
         return
@@ -1196,10 +1230,11 @@ async def cb_customers_list(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     for c in page_custs:
         bud_str = f" | بودجه: {c.max_budget:,.0f}" if c.max_budget else ""
         cat_str = f" | {c.category}" if c.category else ""
-        lines.append(f"• `{c.user_id}` — {c.name or 'ناشناس'}{cat_str}{bud_str}")
+        bell    = " 🔔" if c.notify_enabled else ""
+        lines.append(f"• `{c.user_id}` — {c.name or 'ناشناس'}{cat_str}{bud_str}{bell}")
 
     text = (
-        f"👥 *مشتریان با نوتیف فعال* ({len(custs)} نفر)\n"
+        f"👥 *همه مشتریان* ({len(custs)} نفر)\n"
         f"صفحه {page + 1}/{total_pages}\n\n"
         + "\n".join(lines)
     )
@@ -1305,6 +1340,73 @@ async def cb_customers_notify_confirm(update: Update, context: ContextTypes.DEFA
     except Exception as exc:
         logger.error("Manual notify failed: %s", exc, exc_info=True)
         await _safe_edit(q.message, f"❌ خطا در ارسال نوتیف: {exc}", reply_markup=back_to_dashboard_kb())
+
+
+# ── Back-in-stock requests (Task 6) ─────────────────────────────────────────
+
+async def cb_back_in_stock(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0) -> None:
+    """📦 درخواست‌های موجودی — admin view of the back-in-stock waitlist."""
+    q = update.callback_query
+    stock_svc = context.bot_data.get("stock_notification_service")
+    if stock_svc is None:
+        await _safe_edit(q.message, "⚠️ سرویس موجودی در دسترس نیست.", reply_markup=back_to_dashboard_kb())
+        return
+
+    try:
+        requests = await asyncio.to_thread(stock_svc.get_all_requests)
+    except Exception as exc:
+        logger.error("Failed to load back-in-stock requests: %s", exc)
+        await _safe_edit(q.message, f"❌ خطا: {exc}", reply_markup=back_to_dashboard_kb())
+        return
+
+    waiting_count = sum(1 for r in requests if str(r.get("status", "") or "").strip().lower() == "waiting")
+
+    if not requests:
+        await _safe_edit(
+            q.message,
+            "📦 *درخواست‌های موجودی*\n\n"
+            "هنوز هیچ درخواستی ثبت نشده.\n\n"
+            "وقتی مشتری درباره محصولی ناموجود سوال کند، درخواستش خودکار اینجا ثبت می‌شود.",
+            parse_mode="Markdown",
+            reply_markup=back_to_dashboard_kb(),
+        )
+        return
+
+    per_page = 8
+    total_pages = max(1, -(-len(requests) // per_page))
+    page = max(0, min(page, total_pages - 1))
+    page_reqs = requests[page * per_page: (page + 1) * per_page]
+
+    status_label = {"waiting": "⏳ در انتظار", "notified": "✅ اطلاع داده شد"}
+    lines = []
+    for r in page_reqs:
+        status = str(r.get("status", "") or "").strip().lower()
+        label  = status_label.get(status, status or "؟")
+        pname  = _md_escape(r.get("product_name") or "؟")
+        pid    = r.get("product_id") or "؟"
+        uname  = _md_escape(str(r.get("user_name") or r.get("user_id") or "ناشناس"))
+        date   = r.get("requested_at") or "—"
+        lines.append(f"• [{pid}] {pname} — {uname} — {date} — {label}")
+
+    text = (
+        f"📦 *درخواست‌های موجودی*\n\n"
+        f"⏳ در انتظار: `{waiting_count}`  |  📋 کل: `{len(requests)}`\n"
+        f"صفحه {page + 1}/{total_pages}\n\n"
+        + "\n".join(lines)
+    )
+
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ قبل", callback_data=f"a:bis:{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("بعد ▶️", callback_data=f"a:bis:{page + 1}"))
+    kb_rows = []
+    if nav:
+        kb_rows.append(nav)
+    kb_rows.append([InlineKeyboardButton("🔙 برگشت", callback_data="a:d")])
+
+    await _safe_edit(q.message, text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb_rows))
 
 
 # ── Support ───────────────────────────────────────────────────────────────────
