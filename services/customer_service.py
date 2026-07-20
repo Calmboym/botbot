@@ -264,6 +264,33 @@ class CustomerService:
         except Exception as exc:
             logger.error("Failed to set notify for user %d: %s", user_id, exc)
 
+    def get_all_profiles(self) -> list[CustomerProfile]:
+        """
+        Return EVERY customer profile saved in the sheet, regardless of
+        their notify opt-in status.
+
+        This is the correct source for "how many customers do we have" —
+        get_notify_profiles() below intentionally only returns the subset
+        opted into restock notifications (a much smaller number), which is
+        why the admin panel must not use it for the overall customer count
+        or list (see handlers/admin.cb_customers / cb_customers_list).
+        """
+        try:
+            ws = self._ws()
+            records = ws.get_all_records(numericise_ignore=["all"])
+            profiles = []
+            for r in records:
+                if not str(r.get("user_id", "") or "").strip():
+                    continue
+                try:
+                    profiles.append(self._profile_from_row(r))
+                except Exception as exc:
+                    logger.warning("Skipping malformed customer row: %s", exc)
+            return profiles
+        except Exception as exc:
+            logger.error("Failed to load all customer profiles: %s", exc)
+            return []
+
     def get_notify_profiles(self) -> list[CustomerProfile]:
         """Return CustomerProfile objects for every customer opted into notifications."""
         try:
