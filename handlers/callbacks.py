@@ -158,6 +158,9 @@ async def _route_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, data:
     elif action == "cust_nconf":
         pid = int(params[0]) if params else 0
         await adm.cb_customers_notify_confirm(update, context, pid)
+    elif action == "bis":
+        page = int(params[0]) if params else 0
+        await adm.cb_back_in_stock(update, context, page)
     elif action == "sup":
         await adm.cb_support_list(update, context)
     elif action == "sup_c":
@@ -297,6 +300,26 @@ async def _route_customer(update: Update, context: ContextTypes.DEFAULT_TYPE, da
         except Exception as exc:
             logger.error("notify toggle error for user %d: %s", uid, exc)
             await query.answer("⚠️ خطا در ثبت. دوباره تلاش کنید.", show_alert=True)
+
+    # ── 🛍 View a product from the automatic back-in-stock notification ──────
+    elif action == "viewstock":
+        pid = int(params[0]) if params else 0
+        try:
+            product = await asyncio.to_thread(sheet.get_product_by_id, pid)
+            if product is None:
+                await query.answer("⚠️ محصول یافت نشد.", show_alert=True)
+                return
+            await query.answer()
+            from services.publish_service import send_product_photo
+            sent = await send_product_photo(context.bot, query.message.chat_id, product)
+            if not sent:
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=f"💍 {product.name}\n\n(تصویر این محصول موجود نیست)",
+                )
+        except Exception as exc:
+            logger.error("viewstock callback error (pid=%s): %s", params, exc)
+            await query.answer("⚠️ خطا. دوباره تلاش کنید.", show_alert=True)
 
     else:
         logger.warning("Unhandled customer callback: %r", action)
