@@ -42,10 +42,11 @@ GOOGLE_SCOPES: list[str]  = [
 ]
 
 # ── Sheet / Tab Names ─────────────────────────────────────────────────────────
-PRODUCTS_SHEET: str  = "products"
-SETTINGS_SHEET: str  = "settings"
-FAQ_SHEET: str       = "faq"
-CUSTOMERS_SHEET: str = "customers"
+PRODUCTS_SHEET: str      = "products"
+SETTINGS_SHEET: str      = "settings"
+FAQ_SHEET: str           = "faq"
+CUSTOMERS_SHEET: str     = "customers"
+BACK_IN_STOCK_SHEET: str = "back_in_stock"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_LEVEL: str        = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -83,8 +84,8 @@ GROQ_VISION_MODEL: str = os.environ.get(
 
 # ── Gemini (skeleton — see providers/gemini_provider.py) ──────────────────────
 GEMINI_API_KEY: str      = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL: str        = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
-GEMINI_VISION_MODEL: str = os.environ.get("GEMINI_VISION_MODEL", "gemini-2.5-flash-lite").strip()
+GEMINI_MODEL: str        = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash").strip()
+GEMINI_VISION_MODEL: str = os.environ.get("GEMINI_VISION_MODEL", "gemini-1.5-flash").strip()
 
 # ── OpenAI (skeleton — see providers/openai_provider.py) ──────────────────────
 OPENAI_API_KEY: str      = os.environ.get("OPENAI_API_KEY", "").strip()
