@@ -35,7 +35,7 @@ from services.publish_service import send_product_photo
 from services.search_service import build_query, search
 from services.sheet_service import SheetService
 from services.summary_service import SummaryService
-from services.telegram_service import notify_admin_support
+from services.telegram_service import notify_admin_order, notify_admin_support
 from utils.cache import Cache, ConversationState
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,7 @@ def _services(context: ContextTypes.DEFAULT_TYPE):
         context.bot_data["cache"],
         context.bot_data.get("customer_service"),
         context.bot_data.get("summary_service"),
+        context.bot_data.get("stock_notification_service"),
     )
 
 
@@ -105,7 +106,7 @@ async def _persist_profile(cust_svc: "CustomerService", conv_state: Conversation
 # ── /start ────────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    sheet, _, _, cache, _, _ = _services(context)
+    sheet, _, _, cache, _, _, _ = _services(context)
     user = update.effective_user
     cache.stats.record_message(user.id)
 
@@ -130,7 +131,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _try_fast_photo_path(update: Update, context: ContextTypes.DEFAULT_TYPE, user_message: str) -> bool:
     """Zero-AI-call path: explicit photo keyword while focused on one product."""
-    sheet, _, _, cache, _, _ = _services(context)
+    sheet, _, _, cache, _, _, _ = _services(context)
     user_id = update.effective_user.id
     conv_state = cache.get_conversation(user_id)
 
@@ -195,7 +196,7 @@ async def _process_ai_message(
     user_message: str,
     image_bytes: bytes | None = None,
 ) -> None:
-    sheet, gold, ai, cache, cust_svc, summary_svc = _services(context)
+    sheet, gold, ai, cache, cust_svc, summary_svc, stock_svc = _services(context)
     user    = update.effective_user
     user_id = user.id
     chat_id = update.effective_chat.id
@@ -225,6 +226,19 @@ async def _process_ai_message(
 
         if product:
             price = calculate_price(product, gold_price)
+
+            # ── Task 3: product unavailable → silently remember the request ──
+            # Deterministic, same availability check search_service already
+            # uses to decide what the AI gets to see — no AI/prompt involved,
+            # nothing shown to the customer here (see stock_notification_service
+            # module docstring for why this is a separate system from the
+            # existing preference-based notify_interested_customers).
+            if not product.is_available and stock_svc:
+                asyncio.create_task(asyncio.to_thread(
+                    stock_svc.add_request,
+                    user_id, user.full_name or str(user_id), chat_id, product.id, product.name,
+                ))
+
             try:
                 ai_response = await ai.handle_product_question(
                     profile=conv_state.profile,
@@ -249,7 +263,14 @@ async def _process_ai_message(
             await _persist_profile(cust_svc, conv_state)
 
             if ai_response.needs_support:
-                await _escalate_to_support(update, context, user, user_message, cache)
+                if product.is_available:
+                    await _escalate_to_support(
+                        update, context, user, user_message, cache,
+                        product=product, price=price, gold_price=gold_price,
+                        currency=currency_label(settings),
+                    )
+                else:
+                    await _escalate_to_support(update, context, user, user_message, cache)
             return
 
     # ── Normal AI chat flow ────────────────────────────────────────────────────
@@ -331,8 +352,22 @@ async def _process_ai_message(
         await _escalate_to_support(update, context, user, user_message, cache)
 
 
-async def _escalate_to_support(update, context, user, last_message: str, cache: Cache) -> None:
-    """Add to support queue, notify admin, tell the customer."""
+async def _escalate_to_support(
+    update, context, user, last_message: str, cache: Cache,
+    product=None, price: float | None = None, gold_price: float | None = None, currency: str | None = None,
+) -> None:
+    """
+    Add to support queue, notify admin, tell the customer.
+
+    Task 2: when `product` is passed (customer was focused on one specific
+    AVAILABLE product right before escalating — see _process_ai_message),
+    the admin gets the richer order notification with full product/price
+    details instead of the generic support ping. This project has no
+    separate checkout step, so this escalation is the closest concrete
+    "customer wants to buy X" event that exists — see the notify_admin_order
+    docstring in services/telegram_service.py for the full rationale.
+    The customer-facing message below is identical either way.
+    """
     user_id   = user.id
     user_name = user.full_name or str(user_id)
 
@@ -342,7 +377,13 @@ async def _escalate_to_support(update, context, user, last_message: str, cache: 
     conv.support_requested = True
     cache.save_conversation(conv)
 
-    await notify_admin_support(context.bot, user_id, user_name, last_message)
+    if product is not None:
+        await notify_admin_order(
+            context.bot, user_id, user_name, user.username,
+            product, price or 0.0, gold_price or 0.0, currency or "",
+        )
+    else:
+        await notify_admin_support(context.bot, user_id, user_name, last_message)
 
     await update.message.reply_text(
         "🧑‍💼 درخواست شما ثبت شد.\n"
