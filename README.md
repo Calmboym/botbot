@@ -223,6 +223,21 @@ occasion | shopping_stage | interest_level | notify | last_seen | updated_at
 > earlier, simpler `customers` sheet. Delete (or rename) any existing
 > `customers` tab so the bot recreates it with the new columns on first use.
 
+### Sheet 5 — `back_in_stock`
+
+Created automatically the first time a customer asks about a product that
+turns out to be unavailable — no manual setup needed. Headers (auto-created):
+
+```
+user_id | user_name | chat_id | product_id | product_name |
+requested_at | status | notified_at
+```
+
+`status` is `waiting` until that exact product becomes available again
+(stock or status edited by the admin), at which point the bot messages
+that customer automatically, flips the row to `notified`, and never sends
+it again. See "📦 Back-In-Stock Requests" below.
+
 ### Share with Service Account
 
 **Share → paste `client_email` from `service_account.json` → Editor → Send**
@@ -430,7 +445,8 @@ Send `/admin` to the bot in a private chat.
 | ❌ حذف محصول | Select → confirm → delete |
 | 🪙 بروزرسانی قیمت | Scrape tgju.org or enter manually |
 | 📊 آمار | Product counts, stock, users, messages |
-| 👥 مشتریان | View wishlists, send manual restock notifications |
+| 👥 مشتریان | View **every** saved customer, send manual restock notifications |
+| 📦 درخواست‌های موجودی | View the back-in-stock waitlist (who's waiting, for what, since when) |
 | 💬 پشتیبانی | View and reply to customer support requests |
 | ⚙️ تنظیمات | Store name, phone, address, currency |
 | 📁 پشتیبان‌گیری | Download JSON backup of all products |
@@ -442,6 +458,19 @@ When prompted for a photo during **➕ افزودن محصول** or editing a pr
 1. Simply **send a photo** in the Telegram chat with the bot
 2. Bot saves the `telegram_file_id` to Google Sheets automatically
 3. No external hosting required — Telegram stores the file
+
+### Order Notifications (admin)
+
+This project has no separate checkout/order step — a customer reaches
+"ready to buy" by asking about one specific product and then triggering
+the AI's escalate-to-support flow (🧑‍💼). When that happens while a
+specific, **available** product is in focus, `ADMIN_ID` gets an extra,
+detailed Telegram message (customer, product, product ID, weight,
+calculated price, gold price used, timestamp) instead of the plain
+support ping — the customer's own confirmation message is unchanged
+either way. If escalation happens with no product in focus (or the
+product turned out to be unavailable), admin gets the original, simpler
+support notification instead.
 
 ---
 
@@ -470,6 +499,33 @@ When prompted for a photo during **➕ افزودن محصول** or editing a pr
 4. Their preferences are saved in the `customers` sheet with `notify=yes`
 5. When admin uses **👥 مشتریان → ارسال نوتیف دستی** and selects a product,
    the bot automatically messages all matching opted-in customers
+
+This is a **fuzzy, manual** system: admin picks a product and the bot
+broadcasts to whoever's *stated preferences* look like a good fit.
+
+---
+
+## 📦 Back-In-Stock Requests
+
+A second, separate system — **exact, fully automatic**, no admin action
+needed:
+
+1. Customer taps 🤖 on a channel post, then asks about that one product
+2. If it's currently unavailable (sold out / draft), the bot silently
+   saves a waiting request to the `back_in_stock` sheet — nothing shown
+   to the customer, nothing asked twice
+3. Whenever the admin edits that **exact product's** `stock` or `status`
+   field (list, `/edit <id>`, or the field-option buttons — any path)
+   and it becomes available again, every waiting customer is messaged
+   automatically with a **🛍 مشاهده محصول** button
+4. Each request is marked `notified` immediately after sending, so it is
+   structurally impossible to notify the same customer twice for the
+   same product
+5. Admin can see the full waitlist any time via **📦 درخواست‌های موجودی**
+
+Unlike the preference-based system above, this one is about ONE specific
+product a customer already showed interest in — not a broad preference
+match.
 
 ---
 
