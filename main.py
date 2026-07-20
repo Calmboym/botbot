@@ -55,6 +55,7 @@ from services.customer_service import CustomerService
 from services.gold_service import GoldService
 from services.price_service import currency_label
 from services.sheet_service import SheetService
+from services.stock_notification_service import StockNotificationService
 from services.summary_service import SummaryService
 from utils.cache import Cache
 from utils.logger import setup_logger
@@ -213,6 +214,7 @@ def build_application() -> Application:
     ai_service       = AIService(ai_provider)
     summary_service  = SummaryService(ai_provider)
     customer_service = CustomerService()
+    stock_notification_service = StockNotificationService()
 
     application = (
         Application.builder()
@@ -226,6 +228,7 @@ def build_application() -> Application:
     application.bot_data["ai_service"]       = ai_service
     application.bot_data["summary_service"]  = summary_service
     application.bot_data["customer_service"] = customer_service
+    application.bot_data["stock_notification_service"] = stock_notification_service
     application.bot_data["cache"]            = cache
 
     # Handlers
