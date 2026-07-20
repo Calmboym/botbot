@@ -37,6 +37,9 @@ def dashboard_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton("⚙️ تنظیمات",          callback_data="a:se"),
         ],
         [
+            InlineKeyboardButton("📦 درخواست‌های موجودی", callback_data="a:bis:0"),
+        ],
+        [
             InlineKeyboardButton("📁 پشتیبان‌گیری",    callback_data="a:bk"),
             InlineKeyboardButton("🔄 همگام‌سازی شیت",  callback_data="a:sync"),
         ],
@@ -296,7 +299,7 @@ def back_to_dashboard_kb() -> InlineKeyboardMarkup:
 def customers_kb(page: int = 0, customers: list | None = None) -> InlineKeyboardMarkup:
     """Customers overview panel keyboard."""
     rows = [
-        [InlineKeyboardButton("📋 لیست علاقه‌مندی‌ها",   callback_data="a:cust_list:0")],
+        [InlineKeyboardButton("📋 لیست مشتریان",           callback_data="a:cust_list:0")],
         [InlineKeyboardButton("📢 ارسال نوتیف دستی",       callback_data="a:cust_notify")],
         [InlineKeyboardButton("🔙 برگشت",                  callback_data="a:d")],
     ]
