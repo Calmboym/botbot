@@ -5,7 +5,10 @@ Utility functions for bot-to-bot and bot-to-user interactions
 that don't belong to publishing or AI.
 """
 
+import datetime
 import logging
+from typing import Optional
+
 from telegram import Bot
 from telegram.error import Forbidden, TelegramError
 
@@ -39,6 +42,52 @@ async def notify_admin_support(
         logger.info("Support notification sent to admin for user %d.", user_id)
     except TelegramError as exc:
         logger.error("Could not notify admin about support request: %s", exc)
+
+
+async def notify_admin_order(
+    bot: Bot,
+    user_id: int,
+    user_name: str,
+    username: Optional[str],
+    product,
+    price: float,
+    gold_price: float,
+    currency: str,
+) -> None:
+    """
+    Task 2 — immediately notify ADMIN_ID with full order/product context.
+
+    This project has no separate checkout/order step: a customer reaches
+    this point by asking about ONE specific product and then triggering
+    the AI's needs_support escalation (see _escalate_to_support in
+    handlers/customer.py) — the closest concrete "ready to buy" signal
+    that exists today. This is purely an ADDITIONAL admin-facing message;
+    the customer's own confirmation text is unchanged.
+    """
+    from models.product import _md_escape
+
+    username_line = f"@{username}" if username else "ثبت نشده"
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    text = (
+        f"🔔 *سفارش جدید*\n\n"
+        f"👤 مشتری:\n[{_md_escape(user_name)}](tg://user?id={user_id})\n\n"
+        f"🆔 نام کاربری:\n{_md_escape(username_line)}\n\n"
+        f"🔢 شناسه تلگرام:\n`{user_id}`\n\n"
+        f"📞 تلفن:\nثبت نشده\n\n"
+        f"💍 محصول:\n{_md_escape(product.name)}\n\n"
+        f"🆔 شناسه محصول:\n`{product.id}`\n\n"
+        f"📂 دسته‌بندی:\n{_md_escape(product.category) or '—'}\n\n"
+        f"⚖️ وزن:\n`{product.weight} گرم`\n\n"
+        f"💰 قیمت محاسبه‌شده:\n`{price:,.0f} {currency}`\n\n"
+        f"🪙 قیمت طلای استفاده‌شده:\n`{gold_price:,.0f} {currency}/گرم`\n\n"
+        f"🕒 تاریخ:\n`{now}`"
+    )
+    try:
+        await bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="Markdown")
+        logger.info("Order notification sent to admin — user %d, product %d.", user_id, product.id)
+    except TelegramError as exc:
+        logger.error("Could not notify admin about order (user %d, product %d): %s", user_id, product.id, exc)
 
 
 async def send_admin_reply_to_customer(
