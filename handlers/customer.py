@@ -20,13 +20,18 @@ Flow per message:
 
 import asyncio
 import logging
+from typing import Optional
 
 from telegram import Update
 from telegram.constants import ChatAction
+from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
-from config.config import IMAGE_REQUEST_KEYWORDS, RECENT_MESSAGES_COUNT
-from keyboards.customer_keyboard import build_notify_keyboard, build_support_keyboard
+from config.config import IMAGE_REQUEST_KEYWORDS, PRODUCT_LIST_KEYWORDS, FULL_CATALOG_OVERRIDE_KEYWORDS, RECENT_MESSAGES_COUNT
+from keyboards.customer_keyboard import (
+    build_notify_keyboard, build_support_keyboard,
+    customer_products_list_kb, start_menu_kb,
+)
 from services.ai_service import AIService
 from services.customer_service import CustomerService
 from services.gold_service import GoldService
@@ -59,6 +64,66 @@ def _wants_photo(text: str) -> bool:
     """Cheap, local, NO-AI-CALL check for an explicit photo request."""
     t = text.strip().lower()
     return any(kw in t for kw in IMAGE_REQUEST_KEYWORDS)
+
+
+def _wants_product_list(text: str) -> bool:
+    """Cheap, local, NO-AI-CALL check for an explicit 'show me the catalog' request."""
+    t = text.strip().lower()
+    return any(kw in t for kw in PRODUCT_LIST_KEYWORDS)
+
+
+def _wants_full_catalog(text: str) -> bool:
+    """True if this message explicitly asks for EVERYTHING, overriding any ongoing category context."""
+    t = text.strip().lower()
+    return any(kw in t for kw in FULL_CATALOG_OVERRIDE_KEYWORDS)
+
+
+async def _render_product_list(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    category: Optional[str],
+    page: int = 0,
+    edit_message=None,
+) -> None:
+    """
+    Shared renderer for the customer product browser — same paginated,
+    tappable layout as the admin product list (see
+    keyboards.customer_keyboard.customer_products_list_kb), just
+    read-only. Used by /products, the c:pl pagination callback, and the
+    AI-flow "customer asked for the list" hook below, so all three stay
+    in sync for free.
+
+    edit_message: pass the message to edit in place for pagination taps;
+    leave None to send a fresh message (command / AI-triggered display).
+    Falls back to sending fresh if the edit fails for any reason.
+    """
+    sheet: SheetService = context.bot_data["sheet_service"]
+    products = await asyncio.to_thread(sheet.get_products)
+    available = [p for p in products if p.is_available]
+    filtered = (
+        [p for p in available if category.lower() in (p.category or "").lower()]
+        if category else available
+    )
+
+    if not filtered:
+        text = (
+            f"😔 در حال حاضر محصولی در دسته «{category}» موجود نیست."
+            if category else "😔 در حال حاضر محصولی موجود نیست."
+        )
+        kb = None
+    else:
+        label = f" — {category}" if category else ""
+        text = f"📋 *لیست محصولات{label}* ({len(filtered)} مورد)\n\nبرای دیدن جزئیات، روی هر محصول بزنید 👇"
+        kb = customer_products_list_kb(filtered, page)
+
+    if edit_message is not None:
+        try:
+            await edit_message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+            return
+        except TelegramError:
+            pass  # fall through and send fresh below
+
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=kb)
 
 
 async def _send_images(context, sheet: SheetService, chat_id: int, product_ids: list[int]) -> None:
@@ -121,10 +186,25 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• بودجه و سلیقه‌تان را بگویید\n"
         "• تصویر جواهر دلخواهتان را بفرستید\n"
         "• درخواست عکس هر محصول را بدهید\n"
-        "• قیمت‌ها را بررسی کنید\n\n"
+        "• قیمت‌ها را بررسی کنید\n"
+        "• یا لیست کامل محصولات را ببینید 👇\n\n"
         "چطور می‌توانم کمکتان کنم؟",
         parse_mode="Markdown",
+        reply_markup=start_menu_kb(),
     )
+
+
+async def cmd_products(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/products — always shows the full, unfiltered catalog from page 0."""
+    _, _, _, cache, _, _, _ = _services(context)
+    user = update.effective_user
+    cache.stats.record_message(user.id)
+
+    conv_state = cache.get_conversation(user.id)
+    conv_state.product_list_category = None
+    cache.save_conversation(conv_state)
+
+    await _render_product_list(context, update.effective_chat.id, category=None, page=0)
 
 
 # ── Fast path: direct photo request while focused on one product ──────────────
@@ -325,6 +405,19 @@ async def _process_ai_message(
                 stock_svc.add_request,
                 user_id, user.full_name or str(user_id), chat_id, matched_product.id, matched_product.name,
             ))
+
+    # ── Customer explicitly asked to see the (browsable) product list ────────
+    # Deterministic local keyword check (same style as _wants_photo) — no
+    # AI/prompt change, and the AI's own text reply above is untouched
+    # either way; this ADDITIONALLY sends the same tappable catalog
+    # reachable via /products. Filtered by the customer's ongoing
+    # category context (e.g. "لیست انگشتراتونو بده" merges category=انگشتر
+    # into the profile above first), unless they explicitly asked for
+    # everything ("همه محصولاتتون"), which always means the full catalog.
+    if _wants_product_list(user_message):
+        category = None if _wants_full_catalog(user_message) else conv_state.profile.category
+        conv_state.product_list_category = category
+        asyncio.create_task(_render_product_list(context, chat_id, category, page=0))
 
     # ── Defensive local fallback: customer clearly asked for a photo but ─────
     # the AI didn't include an image_product_ids entry.
