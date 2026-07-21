@@ -1229,9 +1229,10 @@ async def cb_customers_list(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     lines = []
     for c in page_custs:
         bud_str = f" | بودجه: {c.max_budget:,.0f}" if c.max_budget else ""
-        cat_str = f" | {c.category}" if c.category else ""
+        cat_str = f" | {_md_escape(c.category)}" if c.category else ""
         bell    = " 🔔" if c.notify_enabled else ""
-        lines.append(f"• `{c.user_id}` — {c.name or 'ناشناس'}{cat_str}{bud_str}{bell}")
+        safe_name = _md_escape(c.name) if c.name else "ناشناس"
+        lines.append(f"• `{c.user_id}` — {safe_name}{cat_str}{bud_str}{bell}")
 
     text = (
         f"👥 *همه مشتریان* ({len(custs)} نفر)\n"
