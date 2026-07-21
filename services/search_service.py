@@ -373,3 +373,76 @@ def notification_similarity(product: "Product", profile: CustomerProfile, price:
     total_weight   = sum(w for w, _ in checks)
     matched_weight = sum(w for w, ok in checks if ok)
     return round(matched_weight / total_weight, 3) if total_weight else 0.0
+
+
+def find_unavailable_match(
+    products: list["Product"],
+    profile: CustomerProfile,
+    gold_price: float,
+    min_score: Optional[float] = None,
+) -> Optional["Product"]:
+    """
+    Among products that are CURRENTLY UNAVAILABLE (sold out / draft), find
+    the single best match for this customer's profile.
+
+    This is notification_similarity()'s exact weighting philosophy run in
+    reverse: that function only ever looks at AVAILABLE products (it
+    exists to catch a newly-restocked item for the manual broadcast); this
+    one only ever looks at UNAVAILABLE ones, so the general chat flow can
+    attach a "let me know when it's back" request to one concrete
+    product_id even when the customer never tapped a specific product's
+    "ask about this" button — see handlers/customer.py._process_ai_message.
+
+    Deliberately conservative: returns None (no attachment) unless a
+    product clears min_score confidence, so a low-confidence guess never
+    risks notifying a customer about the wrong item. When None, the
+    customer's want is still captured by the existing, broader
+    notify_enabled preference flag on their profile — nothing is lost,
+    it's just not tied to one specific product.
+    """
+    from config.config import NOTIFICATION_SIMILARITY_THRESHOLD
+    from services.price_service import calculate_price
+
+    if min_score is None:
+        min_score = NOTIFICATION_SIMILARITY_THRESHOLD
+
+    if not profile.has_any_preference():
+        return None
+
+    best_product: Optional["Product"] = None
+    best_score = 0.0
+
+    for product in products:
+        if product.is_available:
+            continue
+
+        price = calculate_price(product, gold_price)
+        checks: list[tuple[float, bool]] = []
+
+        if profile.category:
+            checks.append((0.25, profile.category.lower() in (product.category or "").lower()))
+        if profile.gender:
+            checks.append((0.10, profile.gender == product.gender or product.gender == "یونیسکس"))
+        if profile.gold_color:
+            checks.append((0.20, profile.gold_color.lower() in (product.gold_color or "").lower()))
+        if profile.stone:
+            if profile.stone == "none":
+                checks.append((0.15, not product.stone or product.stone in ("", "بدون سنگ", "ندارد")))
+            else:
+                checks.append((0.15, bool(product.stone) and profile.stone.lower() in product.stone.lower()))
+        if profile.max_budget:
+            checks.append((0.20, price <= profile.max_budget))
+        if profile.max_weight:
+            checks.append((0.10, product.weight <= profile.max_weight))
+
+        if not checks:
+            continue
+
+        total_weight   = sum(w for w, _ in checks)
+        matched_weight = sum(w for w, ok in checks if ok)
+        score = (matched_weight / total_weight) if total_weight else 0.0
+
+        if score > best_score:
+            best_score, best_product = score, product
+
+    return best_product if best_score >= min_score else None
