@@ -1384,10 +1384,11 @@ async def cb_back_in_stock(update: Update, context: ContextTypes.DEFAULT_TYPE, p
         status = str(r.get("status", "") or "").strip().lower()
         label  = status_label.get(status, status or "؟")
         pname  = _md_escape(r.get("product_name") or "؟")
-        pid    = r.get("product_id") or "؟"
+        raw_pid = str(r.get("product_id", "") or "").strip()
+        pid_str = f"[{raw_pid}]" if raw_pid and raw_pid != "0" else "❓ بدون کد"
         uname  = _md_escape(str(r.get("user_name") or r.get("user_id") or "ناشناس"))
         date   = r.get("requested_at") or "—"
-        lines.append(f"• [{pid}] {pname} — {uname} — {date} — {label}")
+        lines.append(f"• {pid_str} {pname} — {uname} — {date} — {label}")
 
     text = (
         f"📦 *درخواست‌های موجودی*\n\n"
