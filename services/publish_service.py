@@ -117,6 +117,7 @@ async def send_product_photo(
     chat_id: int,
     product: Product,
     caption: Optional[str] = None,
+    reply_markup=None,
 ) -> bool:
     """
     Send a product photo directly to a customer's private chat.
@@ -126,6 +127,10 @@ async def send_product_photo(
     intentionally keeps using the simple, fixed product.channel_caption()
     (no per-post attribute selection or footer) unless an explicit caption
     is passed in.
+
+    reply_markup is optional (default None, matching every existing
+    caller's behavior exactly) — used by the customer product-list detail
+    view to attach a keyboard to the photo itself.
 
     Uses product.telegram_file_id — no download, no re-upload, no Drive.
     Returns True on success, False on failure (logged but never raised).
@@ -145,6 +150,7 @@ async def send_product_photo(
             photo=product.telegram_file_id,
             caption=cap,
             parse_mode="Markdown",
+            reply_markup=reply_markup,
         )
         logger.info("Sent product %d photo to chat %d.", product.id, chat_id)
         return True
