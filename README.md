@@ -583,6 +583,14 @@ Either path continues the same from here:
    same product
 5. Admin can see the full waitlist any time via **📦 درخواست‌های موجودی**
 
+**If no existing product confidently matches** (customer asked about a
+product ID that doesn't exist at all, or there's nothing unavailable to
+match against right now), the request is still saved — shown in the
+panel as **❓ بدون کد** with a description built from whatever the
+customer said — rather than being silently dropped. These can't be
+auto-notified later (there's no real SKU to restock), but admin still
+sees them and can follow up manually.
+
 Unlike the preference-based system above, this one is about ONE specific
 product a customer already showed interest in — not a broad preference
 match.
