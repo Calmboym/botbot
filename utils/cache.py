@@ -102,6 +102,7 @@ class ConversationState:
     response_count:      int                 = 0
     support_requested:   bool                = False
     current_product_id:  Optional[int]       = None
+    product_list_category: Optional[str]     = None
     last_activity:        float              = field(default_factory=time.monotonic)
 
     def touch(self) -> None:
