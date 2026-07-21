@@ -20,12 +20,14 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from services.gold_service import GoldService
-from services.price_service import format_price_alert, format_gold_price_alert, currency_label
+from services.price_service import calculate_price, format_price_alert, format_gold_price_alert, currency_label
+from keyboards.customer_keyboard import product_detail_kb
 from services.sheet_service import SheetService
 from utils.cache import Cache
 from utils.validators import is_admin
 
 import handlers.admin as adm
+import handlers.customer as hc
 
 logger = logging.getLogger(__name__)
 
@@ -300,6 +302,53 @@ async def _route_customer(update: Update, context: ContextTypes.DEFAULT_TYPE, da
         except Exception as exc:
             logger.error("notify toggle error for user %d: %s", uid, exc)
             await query.answer("⚠️ خطا در ثبت. دوباره تلاش کنید.", show_alert=True)
+
+    # ── 📋 Product list — pagination tap ──────────────────────────────────────
+    elif action == "pl":
+        page = int(params[0]) if params else 0
+        try:
+            conv_state = cache.get_conversation(query.from_user.id)
+            await hc._render_product_list(
+                context, query.message.chat_id, conv_state.product_list_category,
+                page=page, edit_message=query.message,
+            )
+            await query.answer()
+        except Exception as exc:
+            logger.error("Product list pagination error (page=%s): %s", params, exc)
+            await query.answer("⚠️ خطا. دوباره تلاش کنید.", show_alert=True)
+
+    # ── 💍 Product list — tapped one specific product ─────────────────────────
+    elif action == "pd":
+        pid = int(params[0]) if params else 0
+        try:
+            product = await asyncio.to_thread(sheet.get_product_by_id, pid)
+            if product is None or not product.is_available:
+                await query.answer("⚠️ این محصول دیگر موجود نیست.", show_alert=True)
+                return
+            await query.answer()
+            gp, settings = await asyncio.gather(
+                asyncio.to_thread(gold.get_gold_price),
+                asyncio.to_thread(sheet.get_settings),
+            )
+            price = calculate_price(product, gp)
+            caption = product.channel_caption() + f"\n\n💰 *قیمت: `{price:,.0f} {currency_label(settings)}`*"
+            from services.publish_service import send_product_photo
+            sent = await send_product_photo(
+                context.bot, query.message.chat_id, product,
+                caption=caption, reply_markup=product_detail_kb(pid),
+            )
+            if not sent:
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id, text=caption,
+                    parse_mode="Markdown", reply_markup=product_detail_kb(pid),
+                )
+        except Exception as exc:
+            logger.error("Product detail callback error (pid=%s): %s", params, exc)
+            await query.answer("⚠️ خطا. دوباره تلاش کنید.", show_alert=True)
+
+    # ── page-indicator button: no-op ──────────────────────────────────────────
+    elif action == "noop":
+        await query.answer()
 
     # ── 🛍 View a product from the automatic back-in-stock notification ──────
     elif action == "viewstock":
