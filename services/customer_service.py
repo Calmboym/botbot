@@ -135,14 +135,24 @@ class CustomerService:
             logger.debug("Header check: '%s' headers already valid.", CUSTOMERS_SHEET)
 
     def _find_row(self, ws: gspread.Worksheet, user_id: int) -> tuple[int, Optional[dict]]:
+        """
+        Return this user's MOST RECENT row.
+
+        A customer can now have several rows — one per genuinely distinct
+        want, not just one row overwritten forever (see save_profile /
+        _is_new_want). Scanning to the end and keeping the last match is
+        what makes "the current row to keep refining" mean "the latest
+        one" rather than always the customer's very first-ever message.
+        """
         records = ws.get_all_records(numericise_ignore=["all"])
+        row_idx, rec_found = 0, None
         for offset, rec in enumerate(records):
             try:
                 if int(str(rec.get("user_id", "") or "0").strip()) == user_id:
-                    return offset + 2, rec
+                    row_idx, rec_found = offset + 2, rec
             except (ValueError, TypeError):
                 continue
-        return 0, None
+        return row_idx, rec_found
 
     def _row_from_profile(self, profile: CustomerProfile, notify: bool) -> list[str]:
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -209,13 +219,47 @@ class CustomerService:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
+    def _is_new_want(self, existing_row: dict, profile: CustomerProfile) -> bool:
+        """
+        True when `profile`'s core want — category / gender / gold_color /
+        stone — differs from the customer's latest saved row in a field the
+        new profile actually specifies. Only fields the new profile has an
+        actual value for are compared, so simply adding detail (e.g. a
+        budget) to an otherwise-still-open want is never mistaken for a
+        new one. This is the distinction between "refining the same need"
+        (update in place) and "several different needs/products" (append
+        a new row) — see save_profile.
+        """
+        new_values = {
+            "category": profile.category, "gender": profile.gender,
+            "gold_color": profile.gold_color, "stone": profile.stone,
+        }
+        for field, new_val in new_values.items():
+            if not new_val:
+                continue
+            old_val = str(existing_row.get(field, "") or "").strip()
+            if old_val and old_val.lower() != str(new_val).strip().lower():
+                return True
+        return False
+
     def save_profile(self, profile: CustomerProfile, notify: Optional[bool] = None) -> None:
         """
-        Insert or update a customer's profile row.
+        Insert a customer's profile row, or update their latest one.
+
+        A customer keeps ONE row per distinct want: refining the same want
+        (e.g. adding a budget to an already-open "ring" search) updates
+        that row in place, exactly as before. Asking about something
+        genuinely different (a different category/gender/gold_color/stone
+        — e.g. later asking about a necklace after a ring) appends a NEW
+        row instead of overwriting the previous want, so the sheet keeps a
+        full history of everything this customer has asked about rather
+        than only ever showing their single latest interest.
 
         If `notify` is None, any existing notify flag is preserved (so a
         routine background profile-save never accidentally un-subscribes
-        a customer from restock notifications).
+        a customer from restock notifications) — this also makes the
+        notify opt-in "sticky" across appended want-rows, since it's
+        always carried forward from the customer's latest existing row.
 
         Never raises — CRM write failures are logged, not fatal to chat.
         """
@@ -231,12 +275,19 @@ class CustomerService:
 
             row = self._row_from_profile(profile, notify)
 
-            if existing:
+            if existing and not self._is_new_want(existing, profile):
                 ws.update(range_name=f"A{row_idx}", values=[row])
-                logger.info("Updated existing customer profile for user %d (row %d).", profile.user_id, row_idx)
+                logger.info(
+                    "Updated customer profile row for user %d (row %d) — same want, refined.",
+                    profile.user_id, row_idx,
+                )
             else:
                 ws.append_row(row)
-                logger.info("Inserted new customer profile for user %d.", profile.user_id)
+                logger.info(
+                    "Inserted %s row for user %d.",
+                    "a new-want" if existing else "the first",
+                    profile.user_id,
+                )
 
         except Exception as exc:
             logger.error("Failed to save profile for user %d: %s", profile.user_id, exc)
@@ -264,24 +315,44 @@ class CustomerService:
         except Exception as exc:
             logger.error("Failed to set notify for user %d: %s", user_id, exc)
 
-    def get_all_profiles(self) -> list[CustomerProfile]:
+    def get_all_profiles(self, dedupe: bool = True) -> list[CustomerProfile]:
         """
-        Return EVERY customer profile saved in the sheet, regardless of
-        their notify opt-in status.
+        Return customer profiles saved in the sheet.
 
-        This is the correct source for "how many customers do we have" —
-        get_notify_profiles() below intentionally only returns the subset
-        opted into restock notifications (a much smaller number), which is
-        why the admin panel must not use it for the overall customer count
-        or list (see handlers/admin.cb_customers / cb_customers_list).
+        dedupe=True (default) — one profile per UNIQUE user_id, their most
+        recent row. A customer can have several rows now (see save_profile
+        — one per genuinely distinct want), so this is the correct source
+        for anything that means "how many customers / who are they":
+        admin's overall count (cb_customers), and notify-matching
+        (get_notify_profiles / customers_matching_product below) — without
+        deduping, both would over-count, and a manual broadcast could
+        message the same person twice.
+
+        dedupe=False — every row, in sheet order: the full want-by-want
+        history, e.g. for an admin browsing everything one customer has
+        asked about over time.
         """
         try:
             ws = self._ws()
             records = ws.get_all_records(numericise_ignore=["all"])
+
+            if dedupe:
+                latest_by_user: dict[int, dict] = {}
+                for r in records:
+                    raw_uid = str(r.get("user_id", "") or "").strip()
+                    if not raw_uid:
+                        continue
+                    try:
+                        uid = int(raw_uid)
+                    except ValueError:
+                        continue
+                    latest_by_user[uid] = r  # later rows overwrite -> ends on the latest
+                rows = list(latest_by_user.values())
+            else:
+                rows = [r for r in records if str(r.get("user_id", "") or "").strip()]
+
             profiles = []
-            for r in records:
-                if not str(r.get("user_id", "") or "").strip():
-                    continue
+            for r in rows:
                 try:
                     profiles.append(self._profile_from_row(r))
                 except Exception as exc:
@@ -292,18 +363,14 @@ class CustomerService:
             return []
 
     def get_notify_profiles(self) -> list[CustomerProfile]:
-        """Return CustomerProfile objects for every customer opted into notifications."""
+        """
+        Return CustomerProfile objects for every UNIQUE customer opted
+        into notifications — deduped to their latest row (see
+        get_all_profiles), so a customer with several want-rows is never
+        matched/notified more than once.
+        """
         try:
-            ws = self._ws()
-            records = ws.get_all_records(numericise_ignore=["all"])
-            profiles = []
-            for r in records:
-                if str(r.get("notify", "") or "").strip().lower() == "yes":
-                    try:
-                        profiles.append(self._profile_from_row(r))
-                    except Exception as exc:
-                        logger.warning("Skipping malformed customer row: %s", exc)
-            return profiles
+            return [p for p in self.get_all_profiles(dedupe=True) if p.notify_enabled]
         except Exception as exc:
             logger.error("Failed to load notify profiles: %s", exc)
             return []
