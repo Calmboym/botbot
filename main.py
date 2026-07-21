@@ -48,7 +48,7 @@ from handlers.admin import (
     cmd_publish, cmd_preview, cmd_edit, cmd_delete,
 )
 from handlers.callbacks import callback_router
-from handlers.customer import cmd_start, handle_customer_text, handle_customer_photo
+from handlers.customer import cmd_start, cmd_products, handle_customer_text, handle_customer_photo
 from providers import get_provider
 from services.ai_service import AIService
 from services.customer_service import CustomerService
@@ -84,10 +84,12 @@ async def _setup_commands(application: Application) -> None:
     customers only ever see /start in their hint menu.
     """
     default_commands = [
-        BotCommand("start", "شروع گفتگو با دستیار فروش"),
+        BotCommand("start",    "شروع گفتگو با دستیار فروش"),
+        BotCommand("products", "📋 مشاهده لیست محصولات"),
     ]
     admin_commands = [
-        BotCommand("start",   "شروع گفتگو با دستیار فروش"),
+        BotCommand("start",    "شروع گفتگو با دستیار فروش"),
+        BotCommand("products", "📋 مشاهده لیست محصولات"),
         BotCommand("admin",   "باز کردن پنل مدیریت"),
         BotCommand("publish", "انتشار محصول — لیست، یا مستقیم با شناسه: /publish 15"),
         BotCommand("preview", "پیش‌نمایش پست محصول با شناسه: /preview 15"),
@@ -232,7 +234,8 @@ def build_application() -> Application:
     application.bot_data["cache"]            = cache
 
     # Handlers
-    application.add_handler(CommandHandler("start",   cmd_start))
+    application.add_handler(CommandHandler("start",    cmd_start))
+    application.add_handler(CommandHandler("products", cmd_products))
     application.add_handler(CommandHandler("admin",   cmd_admin))
     # Feature 5 — direct product commands by ID (large-catalog shortcut)
     application.add_handler(CommandHandler("publish", cmd_publish))
