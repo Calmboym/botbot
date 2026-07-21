@@ -28,6 +28,7 @@ from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 from config.config import IMAGE_REQUEST_KEYWORDS, PRODUCT_LIST_KEYWORDS, FULL_CATALOG_OVERRIDE_KEYWORDS, RECENT_MESSAGES_COUNT
+from models.ai_models import CustomerProfile
 from keyboards.customer_keyboard import (
     build_notify_keyboard, build_support_keyboard,
     customer_products_list_kb, start_menu_kb,
@@ -64,6 +65,25 @@ def _wants_photo(text: str) -> bool:
     """Cheap, local, NO-AI-CALL check for an explicit photo request."""
     t = text.strip().lower()
     return any(kw in t for kw in IMAGE_REQUEST_KEYWORDS)
+
+
+def _describe_unmatched_want(profile: CustomerProfile, raw_message: str) -> str:
+    """
+    Human-readable label for a back-in-stock request that couldn't be
+    pinned to an existing product row (see the wants_notification hook in
+    _process_ai_message) — built from whatever profile attributes are
+    known, falling back to the customer's own raw message so admin always
+    sees SOMETHING meaningful in 📦 درخواست‌های موجودی rather than the
+    request being silently dropped.
+    """
+    parts = [p for p in (profile.category, profile.gender, profile.gold_color) if p]
+    if profile.stone and profile.stone != "none":
+        parts.append(profile.stone)
+    described = " ".join(parts)
+    raw = raw_message.strip()
+    if described and raw:
+        return f"{described} («{raw[:60]}»)"
+    return described or raw[:80] or "نامشخص"
 
 
 def _wants_product_list(text: str) -> bool:
@@ -404,6 +424,21 @@ async def _process_ai_message(
             asyncio.create_task(asyncio.to_thread(
                 stock_svc.add_request,
                 user_id, user.full_name or str(user_id), chat_id, matched_product.id, matched_product.name,
+            ))
+        else:
+            # No EXISTING product (sold out or otherwise) confidently matches
+            # — could be a genuinely nonexistent product (e.g. customer asked
+            # about "id 1" which was never a real SKU) or simply nothing
+            # close enough right now. Still record it — product_id=0 is a
+            # sentinel for "no exact SKU" — so a customer who explicitly
+            # asked to be notified is never silently dropped just because
+            # there was nothing to precisely match against. Admin still sees
+            # it in 📦 درخواست‌های موجودی, they just won't get an automatic
+            # notification later since there's no real product to restock.
+            description = _describe_unmatched_want(conv_state.profile, user_message)
+            asyncio.create_task(asyncio.to_thread(
+                stock_svc.add_request,
+                user_id, user.full_name or str(user_id), chat_id, 0, description,
             ))
 
     # ── Customer explicitly asked to see the (browsable) product list ────────
