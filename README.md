@@ -219,6 +219,20 @@ max_budget | min_budget | max_weight | min_weight | style_keywords |
 occasion | shopping_stage | interest_level | notify | last_seen | updated_at
 ```
 
+**A customer can have more than one row.** Each row is one distinct
+*want* — refining the same want (adding a budget, a weight limit, etc. to
+an already-open search) updates that row in place, but asking about a
+genuinely different category/gender/gold_color/stone (e.g. a necklace
+after a ring) appends a **new** row instead of overwriting the previous
+one, so the sheet keeps the customer's full history rather than only
+their single latest interest. `notify=yes` is sticky — it's always
+carried forward onto new want-rows once set.
+
+Anything that means "how many customers / who are they" (the admin
+panel's total count, manual-notify matching) automatically **deduplicates
+to each customer's latest row** so nobody is over-counted or notified
+twice — see `CustomerService.get_all_profiles(dedupe=True)`.
+
 > ⚠️ **If upgrading from an older version:** this schema replaced an
 > earlier, simpler `customers` sheet. Delete (or rename) any existing
 > `customers` tab so the bot recreates it with the new columns on first use.
@@ -508,12 +522,27 @@ broadcasts to whoever's *stated preferences* look like a good fit.
 ## 📦 Back-In-Stock Requests
 
 A second, separate system — **exact, fully automatic**, no admin action
-needed:
+needed. A request gets attached to one specific product_id via either path:
 
+**Path A — focused product Q&A:**
 1. Customer taps 🤖 on a channel post, then asks about that one product
-2. If it's currently unavailable (sold out / draft), the bot silently
-   saves a waiting request to the `back_in_stock` sheet — nothing shown
-   to the customer, nothing asked twice
+2. If it's currently unavailable, the bot silently saves a waiting request
+
+**Path B — ordinary free-text conversation** (no tap needed):
+1. Customer describes what they want and says something like "خبر بده
+   موجود شد" / "اطلاع بده" — the AI already extracts this as
+   `wants_notification` (existing intent field, no prompt change)
+2. The bot looks for the single best-matching **unavailable** product
+   against the customer's profile (category/gender/gold_color/stone/
+   budget), using the same weighted scoring as the existing manual-notify
+   system, just inverted for availability — see
+   `search_service.find_unavailable_match`
+3. Only attaches to a specific product above `NOTIFICATION_SIMILARITY_THRESHOLD`
+   confidence; below that, the want is still captured by the broader
+   `notify_enabled` preference flag (nothing is lost either way)
+
+Either path continues the same from here:
+
 3. Whenever the admin edits that **exact product's** `stock` or `status`
    field (list, `/edit <id>`, or the field-option buttons — any path)
    and it becomes available again, every waiting customer is messaged
