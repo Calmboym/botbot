@@ -110,6 +110,20 @@ IMAGE_REQUEST_KEYWORDS: list[str] = [
     "ببینمش", "ببینم", "فوتو", "عکس بفرست", "عکس بده", "می‌خوام ببینم",
 ]
 
+# Deliberately does NOT include bare "نشون بده" / "نشونم بده" — those are
+# already IMAGE_REQUEST_KEYWORDS above (show me a photo of ONE thing), a
+# different intent from "show me a browsable list of everything".
+PRODUCT_LIST_KEYWORDS: list[str] = [
+    "لیست", "کاتالوگ", "همه محصولات", "همه ی محصولات", "همه‌ی محصولات",
+    "چی دارید", "چی دارین", "چه محصولاتی دارید", "چه محصولاتی دارین",
+    "چه چیزایی دارید", "چه چیزهایی دارید", "موجودیتون", "موجودی‌تون",
+]
+
+# Overrides any ongoing category context back to the FULL catalog even
+# mid-conversation — e.g. "همه محصولاتتون رو نشون بده" after a ring
+# discussion should mean everything, not just rings.
+FULL_CATALOG_OVERRIDE_KEYWORDS: list[str] = ["همه", "کل ", "تمام"]
+
 # ── Notifications / Follow-up ─────────────────────────────────────────────────
 # Similarity score (0..1) a customer's profile must reach for a restocked
 # product to trigger an automatic notification. See services/search_service.py
