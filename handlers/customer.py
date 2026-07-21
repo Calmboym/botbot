@@ -32,7 +32,7 @@ from services.customer_service import CustomerService
 from services.gold_service import GoldService
 from services.price_service import calculate_price, currency_label, normalize_intent_budget
 from services.publish_service import send_product_photo
-from services.search_service import build_query, search
+from services.search_service import build_query, find_unavailable_match, search
 from services.sheet_service import SheetService
 from services.summary_service import SummaryService
 from services.telegram_service import notify_admin_order, notify_admin_support
@@ -308,6 +308,23 @@ async def _process_ai_message(
     # choke point — before ever touching CustomerProfile/search comparisons.
     normalized_intent = normalize_intent_budget(ai_response.intent, settings)
     conv_state.profile = conv_state.profile.merge_intent(normalized_intent)
+
+    # ── Task 3 (general flow): customer wants a notification — try to pin ────
+    # it to one SPECIFIC unavailable product via the same weighted matching
+    # the existing preference system uses (see search_service.
+    # find_unavailable_match). This is what the focused "ask about this
+    # product" branch above already does with a known product_id; this
+    # covers ordinary free-text conversation, which is how customers
+    # actually talk. Falls through silently to the broader notify_enabled
+    # preference flag (already set by merge_intent above) when nothing
+    # matches confidently — nothing is lost either way.
+    if ai_response.intent.wants_notification and stock_svc:
+        matched_product = find_unavailable_match(products, conv_state.profile, gold_price)
+        if matched_product:
+            asyncio.create_task(asyncio.to_thread(
+                stock_svc.add_request,
+                user_id, user.full_name or str(user_id), chat_id, matched_product.id, matched_product.name,
+            ))
 
     # ── Defensive local fallback: customer clearly asked for a photo but ─────
     # the AI didn't include an image_product_ids entry.
