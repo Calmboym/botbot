@@ -502,6 +502,37 @@ support notification instead.
 | Click 🤖 on channel post | Ask questions about that product |
 | "عکسشو بفرست" | Bot sends product photo directly |
 | Click 🔔 notification offer | Subscribe to restock alerts |
+| `/products`, the `/start` button, or "لیست محصولاتتون رو بده" | Browsable product catalog |
+
+---
+
+## 📋 Product List (catalog browsing)
+
+A read-only, tappable catalog for customers, styled exactly like the
+admin's own product list — one product per row, ◀️ page ▶️ navigation —
+reachable three ways:
+
+1. **`/products` command** — always the full, unfiltered catalog
+2. **The button under `/start`**
+3. **Ordinary conversation** — saying something like "لیست محصولاتتون رو
+   بده" or "کاتالوگتون رو میخوام" sends the same tappable list as a
+   supplementary message, *without changing the AI's own reply at all*.
+   Detection is a deterministic local keyword check (see
+   `PRODUCT_LIST_KEYWORDS` in `config/config.py`) — no AI/prompt change.
+
+**Category filtering** — "لیست انگشتراتونو بده" filters to rings only,
+using whatever category the AI already extracted into the customer's
+profile this conversation; saying "همه محصولاتتون" always forces the full
+catalog regardless of context (`FULL_CATALOG_OVERRIDE_KEYWORDS`). The
+active filter is remembered per-customer (`ConversationState.
+product_list_category`) so paging through results keeps the same filter.
+
+Tapping any product sends its photo, full details, and a live-calculated
+price, with a **🤖 سوال درباره این محصول** button that hands off straight
+into the existing focused-product AI conversation.
+
+Only available (in-stock, active) products are ever shown — sold-out
+items are silently excluded, exactly like the AI's own recommendations.
 
 ---
 
